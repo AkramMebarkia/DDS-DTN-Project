@@ -136,11 +136,15 @@ class PHYProfile:
         self.E_rx_per_bit = E_rx_per_bit
 
 
-# Same profiles as MQTT baseline
-ZIGBEE = PHYProfile("zigbee", B=250_000.0, P_tx=0.001, N0=1e-13, 
-                    E_tx_per_bit=3e-6, E_rx_per_bit=2.1e-6)
-WIFI = PHYProfile("wifi", B=20_000_000.0, P_tx=0.1, N0=1e-13, 
-                  E_tx_per_bit=5e-7, E_rx_per_bit=3.5e-7)
+# ZigBee 802.15.4 (2.4 GHz) - System-level energy from Siekkinen et al. (IEEE WCNC 2012)
+# Measured: ~1 µJ/bit end-to-end. Using sender-only charging (E_rx=0).
+ZIGBEE = PHYProfile("zigbee", B=250_000.0, P_tx=0.0774, N0=1e-13, 
+                    E_tx_per_bit=1e-6, E_rx_per_bit=0)
+
+# WiFi 802.11 (20 MHz) - System-level energy from Liu & Choi (ACM SIGMETRICS 2023)
+# Measured: ~200 nJ/bit. Using sender-only charging (E_rx=0).
+WIFI = PHYProfile("wifi", B=20_000_000.0, P_tx=1.5, N0=1e-13, 
+                  E_tx_per_bit=2e-7, E_rx_per_bit=0)
 
 REF_DIST = 100.0
 
@@ -376,10 +380,11 @@ class SprayMessage:
     hop_count: int
     tokens: int
     qos: int
+    payload_bytes: int = PhyConst.WIFI_DATA_PAYLOAD_BYTES  # 64B for sensors, 256B for UAV data
     
     def payload_size(self) -> int:
-        """Return WiFi payload size (UAV↔UAV forwarding uses WiFi)"""
-        return PhyConst.WIFI_DATA_PAYLOAD_BYTES
+        """Return configured payload size"""
+        return self.payload_bytes
 
 
 # ==========================================
@@ -912,7 +917,7 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
             if not sensor_queues[s]:
                 continue
             
-            best_uav = min(range(1, NUM_UAVS), 
+            best_uav = min(range(NUM_UAVS), 
                           key=lambda k: np.linalg.norm(agents[k].pos - src_pos))
             rate, d, prof = link_rate(src_pos, agents[best_uav].pos, is_ground_to_uav=True)
             
@@ -924,23 +929,44 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
             
             msg_id, qos_val, t0 = sensor_queues[s][0]
             
-            if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
-                sensor_queues[s].pop(0)
-                new_msg = SprayMessage(
-                    msg_id=msg_id, source_id=s, creation_time=t0,
-                    hop_count=0, tokens=INITIAL_TOKENS, qos=qos_val
-                )
-                agents[best_uav].buffer.append(new_msg)
-                agents[best_uav].seen_msgs.add(msg_id)
-                
-                # Sensor TX energy (ZigBee 802.15.4 frame)
-                frame_bytes = dds_frame_size_zigbee(PhyConst.SENSOR_PAYLOAD_BYTES)
-                sensor_tx_energy += frame_bytes * 8 * prof.E_tx_per_bit
-                
-                # UAV RX energy (ZigBee)
-                rx_e = frame_bytes * 8 * prof.E_rx_per_bit
-                agents[best_uav].energy -= rx_e
-                agents[best_uav].radio_rx_energy += rx_e
+            # Sensor TX energy (ZigBee 802.15.4 frame)
+            frame_bytes = dds_frame_size_zigbee(PhyConst.SENSOR_PAYLOAD_BYTES)
+            
+            # ZigBee max frame constraint
+            if frame_bytes > ZIGBEE_MAX_FRAME:
+                continue
+            
+            # Energy accounting
+            sensor_tx_energy += frame_bytes * 8 * prof.E_tx_per_bit
+            rx_e = frame_bytes * 8 * prof.E_rx_per_bit
+            agents[best_uav].energy -= rx_e
+            agents[best_uav].radio_rx_energy += rx_e
+            
+            # CRITICAL FIX: If sink collects directly, count as instant delivery (like vanilla DDS)
+            if best_uav == SINK_ID:
+                sensor_queues[s].pop(0)  # Pop AFTER successful handling
+                if msg_id not in agents[SINK_ID].delivered_ids:
+                    agents[SINK_ID].delivered_ids.add(msg_id)
+                    agents[SINK_ID].sink_received_count += 1
+                    total_delivered += 1
+                    sink_delivery_events += 1
+                    hop_counts.append(0)  # Direct collection = 0 hops
+                    latencies.append(sim_time - t0)
+            else:
+                # Regular UAV: put in buffer for S&F routing
+                if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
+                    sensor_queues[s].pop(0)  # Pop AFTER successful buffer insertion
+                    new_msg = SprayMessage(
+                        msg_id=msg_id, source_id=s, creation_time=t0,
+                        hop_count=0, tokens=INITIAL_TOKENS, qos=qos_val,
+                        payload_bytes=PhyConst.SENSOR_PAYLOAD_BYTES
+                    )
+                    agents[best_uav].buffer.append(new_msg)
+                    agents[best_uav].seen_msgs.add(msg_id)
+                else:
+                    # Buffer full - BE drops, Reliable stays for retry
+                    if qos_val == 0:
+                        sensor_queues[s].pop(0)
     
     # Compute results
     total_uav_tx = sum(a.radio_tx_energy for a in agents.values())

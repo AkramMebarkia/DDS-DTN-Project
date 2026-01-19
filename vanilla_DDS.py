@@ -85,11 +85,15 @@ class PHYProfile:
         self.E_rx_per_bit = E_rx_per_bit
 
 
-# Same profiles as MQTT baseline
-ZIGBEE = PHYProfile("zigbee", B=250_000.0, P_tx=0.001, N0=1e-13, 
-                    E_tx_per_bit=3e-6, E_rx_per_bit=2.1e-6)
-WIFI = PHYProfile("wifi", B=20_000_000.0, P_tx=0.1, N0=1e-13, 
-                  E_tx_per_bit=5e-7, E_rx_per_bit=3.5e-7)
+# ZigBee 802.15.4 (2.4 GHz) - System-level energy from Siekkinen et al. (IEEE WCNC 2012)
+# Measured: ~1 µJ/bit end-to-end. Using sender-only charging (E_rx=0).
+ZIGBEE = PHYProfile("zigbee", B=250_000.0, P_tx=0.0774, N0=1e-13, 
+                    E_tx_per_bit=1e-6, E_rx_per_bit=0)
+
+# WiFi 802.11 (20 MHz) - System-level energy from Liu & Choi (ACM SIGMETRICS 2023)
+# Measured: ~200 nJ/bit. Using sender-only charging (E_rx=0).
+WIFI = PHYProfile("wifi", B=20_000_000.0, P_tx=1.5, N0=1e-13, 
+                  E_tx_per_bit=2e-7, E_rx_per_bit=0)
 
 REF_DIST = 100.0
 
@@ -119,17 +123,39 @@ def link_rate(pos1, pos2, is_ground_to_uav: bool) -> Tuple[float, float, PHYProf
 
 
 # ==========================================
-# 3) DDS OVERHEAD MODEL
+# 3) DDS OVERHEAD MODEL (ZigBee vs WiFi)
 # ==========================================
 
+# --- RTPS Protocol Overhead ---
+RTPS_MESSAGE_HEADER = 20      # RTPS Header
+RTPS_DATA_SUBMSG_HEADER = 24  # DATA Submessage header
+
+# --- WiFi (802.11) Transport Layer - for UAV↔UAV and UAV→Sink ---
+WIFI_TCP_IP_OVERHEAD = 40     # IP (20) + UDP (8) + RTP/other (12)
+WIFI_L2_OVERHEAD = 30         # WiFi 802.11 MAC/PHY overhead
+WIFI_TRANSPORT_OVERHEAD = WIFI_TCP_IP_OVERHEAD + WIFI_L2_OVERHEAD  # = 70 bytes
+
+# --- ZigBee (802.15.4) Transport Layer - for IoT/Sensor→UAV ---
+ZIGBEE_L2_OVERHEAD = 15       # IEEE 802.15.4 MAC overhead
+ZIGBEE_TRANSPORT_OVERHEAD = ZIGBEE_L2_OVERHEAD  # No TCP/IP for sensors
+
+
+def dds_frame_size_zigbee(payload_bytes: int) -> int:
+    """DDS/RTPS frame size for ZigBee links (IoT/Sensor→UAV)"""
+    return ZIGBEE_TRANSPORT_OVERHEAD + RTPS_MESSAGE_HEADER + RTPS_DATA_SUBMSG_HEADER + payload_bytes
+    # = 15 + 20 + 24 + payload = 59 + payload bytes
+
+
+def dds_frame_size_wifi(payload_bytes: int) -> int:
+    """DDS/RTPS frame size for WiFi links (UAV↔UAV, UAV→Sink)"""
+    return WIFI_TRANSPORT_OVERHEAD + RTPS_MESSAGE_HEADER + RTPS_DATA_SUBMSG_HEADER + payload_bytes
+    # = 70 + 20 + 24 + payload = 114 + payload bytes
+
+
+# Legacy alias (for backward compatibility - defaults to WiFi)
 def dds_frame_size(payload_bytes: int, batched: bool = False) -> int:
-    """
-    Calculate DDS/RTPS frame size.
-    
-    RTPS adds ~64 bytes overhead per packet (no batching - each message separate).
-    """
-    # No batching - each message has full RTPS overhead
-    return payload_bytes + RTPS_HEADER_BYTES
+    """Legacy function - uses WiFi overhead for UAV links"""
+    return dds_frame_size_wifi(payload_bytes)
 
 
 # ==========================================
@@ -280,10 +306,6 @@ class VanillaDDSAgent:
         if is_sink:
             self.delivered_ids = set()
         
-        # Discovery state
-        self.is_matched_with_sink = False
-        self.discovery_timer = 0.0
-        
         # Mobility
         self.vel = np.array([0.0, 0.0, 0.0])
         self._waypoint_timer = 0.0
@@ -292,22 +314,25 @@ class VanillaDDSAgent:
         if self.is_sink:
             return
         
-        self._waypoint_timer -= dt
-        if self._waypoint_timer <= 0:
-            self._waypoint_timer = random.uniform(5.0, 15.0)
-            target = np.array([random.uniform(100, self.area_size-100), 
-                              random.uniform(100, self.area_size-100), PhyConst.H])
-            direction = target - self.pos
-            norm = np.linalg.norm(direction[:2])
-            speed = random.uniform(5.0, 15.0)
-            if norm > 1.0:
-                self.vel[:2] = (direction[:2] / norm) * speed
+        # Random waypoint mobility (matching spray_focus_DDS.py)
+        if not hasattr(self, 'waypoints') or not self.waypoints:
+            self.waypoints = [np.array([random.uniform(100, self.area_size-100), 
+                                        random.uniform(100, self.area_size-100), 
+                                        PhyConst.H]) for _ in range(5)]
         
-        self.pos += self.vel * dt
-        self.pos[0] = np.clip(self.pos[0], 0, self.area_size)
-        self.pos[1] = np.clip(self.pos[1], 0, self.area_size)
+        speed = 20.0  # Fixed 20 m/s (matching S&F simulations)
+        target = self.waypoints[0]
+        direction = target - self.pos
+        dist = np.linalg.norm(direction)
+        step = speed * dt
         
-        flight_power = self.flight_power(np.linalg.norm(self.vel[:2]))
+        if dist <= step:
+            self.pos = target.copy()
+            self.waypoints.pop(0)
+        else:
+            self.pos += (direction / dist) * step
+        
+        flight_power = self.flight_power(speed)
         self.energy -= flight_power * dt
     
     def flight_power(self, velocity: float) -> float:
@@ -413,9 +438,6 @@ def run_vanilla_dds_simulation(config: dict, verbose: bool = False) -> dict:
     data_wifi_rx_energy = 0.0
     data_bytes_sent = 0
     
-    # DDS discovery cost (simulated)
-    DISCOVERY_COST = 0.25  # seconds for PDP/EDP handshake
-    
     # Main loop
     while sim_time < duration:
         sim_time += dt
@@ -446,17 +468,7 @@ def run_vanilla_dds_simulation(config: dict, verbose: bool = False) -> dict:
             rate_bps, d, prof = link_rate(ai.pos, sink.pos, is_ground_to_uav=False)
             
             if rate_bps < prof.B:
-                # Link down - but DON'T reset discovery state
-                # DDS discovery is participant-to-participant, not link-to-link
-                # Once discovered, entities remain matched even if RF path is lost
-                continue
-            
-            # Handle DDS discovery overhead (ONE-TIME per UAV-sink pair)
-            if not ai.is_matched_with_sink:
-                ai.discovery_timer += dt
-                if ai.discovery_timer < DISCOVERY_COST:
-                    continue  # Still discovering
-                ai.is_matched_with_sink = True  # Matched forever now
+                continue  # Link down
             
             max_bytes_this_step = (rate_bps * dt) / 8.0
             bytes_sent = 0
@@ -513,7 +525,7 @@ def run_vanilla_dds_simulation(config: dict, verbose: bool = False) -> dict:
             if not sensor_queues[s]:
                 continue
             
-            best_uav = min(range(1, NUM_UAVS), 
+            best_uav = min(range(NUM_UAVS), 
                           key=lambda k: np.linalg.norm(agents[k].pos - src_pos))
             rate, d, prof = link_rate(src_pos, agents[best_uav].pos, is_ground_to_uav=True)
             
@@ -525,23 +537,42 @@ def run_vanilla_dds_simulation(config: dict, verbose: bool = False) -> dict:
             
             msg_id, qos_val, t0 = sensor_queues[s][0]
             
-            if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
-                sensor_queues[s].pop(0)
-                new_msg = BufferedMessage(
-                    msg_id=msg_id, source_id=s, creation_time=t0,
-                    hop_count=0, qos=qos_val
-                )
-                agents[best_uav].buffer.append(new_msg)
-                agents[best_uav].seen_msgs.add(msg_id)
-                
-                # Sensor TX energy (ZigBee)
-                frame_bytes = dds_frame_size(PhyConst.SENSOR_PAYLOAD_BYTES, batched=False)
-                sensor_tx_energy += frame_bytes * 8 * prof.E_tx_per_bit
-                
-                # UAV RX energy (ZigBee) - MUST account for this!
-                rx_e = frame_bytes * 8 * prof.E_rx_per_bit
-                agents[best_uav].energy -= rx_e
-                agents[best_uav].radio_rx_energy += rx_e
+            # Sensor TX energy (ZigBee)
+            frame_bytes = dds_frame_size_zigbee(PhyConst.SENSOR_PAYLOAD_BYTES)
+            
+            # ZigBee max frame constraint
+            if frame_bytes > ZIGBEE_MAX_FRAME:
+                continue
+            
+            # Energy accounting
+            sensor_tx_energy += frame_bytes * 8 * prof.E_tx_per_bit
+            rx_e = frame_bytes * 8 * prof.E_rx_per_bit
+            agents[best_uav].energy -= rx_e
+            agents[best_uav].radio_rx_energy += rx_e
+            
+            # CRITICAL FIX: If sink collects directly, count as instant delivery
+            if best_uav == SINK_ID:
+                sensor_queues[s].pop(0)  # Pop AFTER successful handling
+                if msg_id not in sink.delivered_ids:
+                    sink.delivered_ids.add(msg_id)
+                    total_delivered += 1
+                    sink_delivery_events += 1
+                    hop_counts.append(0)  # Direct collection = 0 hops
+                    latencies.append(sim_time - t0)
+            else:
+                # Regular UAV: put in buffer for later delivery to sink
+                if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
+                    sensor_queues[s].pop(0)  # Pop AFTER successful buffer insertion
+                    new_msg = BufferedMessage(
+                        msg_id=msg_id, source_id=s, creation_time=t0,
+                        hop_count=0, qos=qos_val
+                    )
+                    agents[best_uav].buffer.append(new_msg)
+                    agents[best_uav].seen_msgs.add(msg_id)
+                else:
+                    # Buffer full - BE drops, Reliable stays for retry
+                    if qos_val == 0:
+                        sensor_queues[s].pop(0)
     
     # Compute results
     total_uav_tx = sum(a.radio_tx_energy for a in agents.values())

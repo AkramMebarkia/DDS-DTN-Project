@@ -69,9 +69,15 @@ class PHYProfile:
         self.E_rx_per_bit = E_rx_per_bit  # J/bit for reception
 
 
-# ZigBee for ground-to-UAV, WiFi for UAV-to-UAV
-ZIGBEE = PHYProfile("zigbee", B=250_000.0, P_tx=0.001, N0=1e-13, E_tx_per_bit=3e-6, E_rx_per_bit=2.1e-6)
-WIFI   = PHYProfile("wifi",   B=20_000_000.0, P_tx=0.1, N0=1e-13, E_tx_per_bit=5e-7, E_rx_per_bit=3.5e-7)
+# ZigBee 802.15.4 (2.4 GHz) - System-level energy from Siekkinen et al. (IEEE WCNC 2012)
+# Measured: ~1 µJ/bit end-to-end (includes TX, RX, CSMA overhead)
+# Using sender-only charging: E_rx=0 since E_tx includes aggregate system cost
+ZIGBEE = PHYProfile("zigbee", B=250_000.0, P_tx=0.0774, N0=1e-13, E_tx_per_bit=1e-6, E_rx_per_bit=0)
+
+# WiFi 802.11 (20 MHz) - System-level energy from Liu & Choi (ACM SIGMETRICS 2023)
+# Measured: ~200 nJ/bit for 20 MHz channel (scaled from 80 MHz baseline)
+# Using sender-only charging: E_rx=0 since E_tx includes aggregate system cost
+WIFI   = PHYProfile("wifi",   B=20_000_000.0, P_tx=1.5, N0=1e-13, E_tx_per_bit=2e-7, E_rx_per_bit=0)
 
 REF_DIST = 100.0  # meters
 
@@ -190,10 +196,11 @@ class SprayMessage:
     tokens: int
     payload: bytes
     qos: int
+    payload_bytes: int = PhyConst.WIFI_DATA_PAYLOAD_BYTES  # 64B for sensors, 256B for UAV data
     
     def payload_size(self) -> int:
-        """Return WiFi payload size (UAV↔UAV forwarding uses WiFi)"""
-        return PhyConst.WIFI_DATA_PAYLOAD_BYTES
+        """Return configured payload size"""
+        return self.payload_bytes
 
 
 # ==========================================
@@ -219,7 +226,14 @@ class MQTTTransmission:
             return False, 0.0, 0.0, 0
         
         payload_bytes = control_msg.payload_size()
-        frame_bytes = mqtt_frame_size(payload_bytes, qos=1)  # Control always QoS 1
+        # Use correct frame size based on link type (ZigBee vs WiFi)
+        if profile.name == "zigbee":
+            frame_bytes = mqtt_frame_size_zigbee(payload_bytes, qos=1)
+            # ZigBee max frame constraint
+            if frame_bytes > ZIGBEE_MAX_FRAME:
+                return False, 0.0, 0.0, 0
+        else:
+            frame_bytes = mqtt_frame_size_wifi(payload_bytes, qos=1)
         bits = frame_bytes * 8
         
         tx_energy = bits * profile.E_tx_per_bit
@@ -243,7 +257,14 @@ class MQTTTransmission:
             return False, 0.0, 0.0, 0
         
         payload_bytes = data_msg.payload_size()
-        frame_bytes = mqtt_frame_size(payload_bytes, data_msg.qos)
+        # Use correct frame size based on link type (ZigBee vs WiFi)
+        if profile.name == "zigbee":
+            frame_bytes = mqtt_frame_size_zigbee(payload_bytes, data_msg.qos)
+            # ZigBee max frame constraint
+            if frame_bytes > ZIGBEE_MAX_FRAME:
+                return False, 0.0, 0.0, 0
+        else:
+            frame_bytes = mqtt_frame_size_wifi(payload_bytes, data_msg.qos)
         bits = frame_bytes * 8
         
         tx_energy = bits * profile.E_tx_per_bit
@@ -265,7 +286,11 @@ class MQTTTransmission:
         if rate_bps < profile.B:
             return False, 0.0, 0.0, 0
         
-        frame_bytes = mqtt_puback_size()
+        # Use correct PUBACK size based on link type (ZigBee vs WiFi)
+        if profile.name == "zigbee":
+            frame_bytes = mqtt_puback_size_zigbee()
+        else:
+            frame_bytes = mqtt_puback_size_wifi()
         bits = frame_bytes * 8
         
         tx_energy = bits * profile.E_tx_per_bit
@@ -864,12 +889,13 @@ def run_mqtt_simulation():
                     hop_count=0,
                     tokens=INITIAL_TOKENS,
                     payload=b"SENSOR_DATA",
-                    qos=qos_val
+                    qos=qos_val,
+                    payload_bytes=PhyConst.SENSOR_PAYLOAD_BYTES  # 64B for ZigBee sensors
                 )
                 
                 # Check bandwidth capacity for this timestep
                 max_bytes_this_step = (rate * dt) / 8.0
-                frame_bytes = mqtt_frame_size(temp_msg.payload_size(), temp_msg.qos)
+                frame_bytes = mqtt_frame_size_zigbee(temp_msg.payload_size(), temp_msg.qos)
                 
                 if frame_bytes > max_bytes_this_step:
                     # Not enough capacity this timestep
@@ -1468,7 +1494,7 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
         for s, src_pos in enumerate(iot_nodes):
             if not sensor_queues[s]:
                 continue
-            best_uav = min(range(1, NUM_UAVS), key=lambda k: np.linalg.norm(agents[k].pos - src_pos))
+            best_uav = min(range(NUM_UAVS), key=lambda k: np.linalg.norm(agents[k].pos - src_pos))
             rate, d, prof = link_rate(src_pos, agents[best_uav].pos, is_ground_to_uav=True)
             
             if rate < prof.B:
@@ -1480,11 +1506,12 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
             msg_id, qos_val, t0 = sensor_queues[s][0]
             temp_msg = SprayMessage(
                 msg_id=msg_id, source_id=s, creation_time=t0,
-                hop_count=0, tokens=INITIAL_TOKENS, payload=b"SENSOR_DATA", qos=qos_val
+                hop_count=0, tokens=INITIAL_TOKENS, payload=b"SENSOR_DATA", qos=qos_val,
+                payload_bytes=PhyConst.SENSOR_PAYLOAD_BYTES  # 64B for ZigBee sensors
             )
             
             max_bytes_this_step = (rate * dt) / 8.0
-            frame_bytes = mqtt_frame_size(temp_msg.payload_size(), temp_msg.qos)
+            frame_bytes = mqtt_frame_size_zigbee(temp_msg.payload_size(), temp_msg.qos)
             if frame_bytes > max_bytes_this_step:
                 if qos_val == 0:
                     sensor_queues[s].pop(0)

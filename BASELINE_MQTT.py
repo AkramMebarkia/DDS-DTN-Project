@@ -74,8 +74,13 @@ class PHYProfile:
         self.E_rx_per_bit = E_rx_per_bit
 
 
-ZIGBEE = PHYProfile("zigbee", B=250_000.0, P_tx=0.001, N0=1e-13, E_tx_per_bit=3e-6, E_rx_per_bit=2.1e-6)
-WIFI = PHYProfile("wifi", B=20_000_000.0, P_tx=0.1, N0=1e-13, E_tx_per_bit=5e-7, E_rx_per_bit=3.5e-7)
+# ZigBee 802.15.4 (2.4 GHz) - System-level energy from Siekkinen et al. (IEEE WCNC 2012)
+# Measured: ~1 µJ/bit end-to-end. Using sender-only charging (E_rx=0).
+ZIGBEE = PHYProfile("zigbee", B=250_000.0, P_tx=0.0774, N0=1e-13, E_tx_per_bit=1e-6, E_rx_per_bit=0)
+
+# WiFi 802.11 (20 MHz) - System-level energy from Liu & Choi (ACM SIGMETRICS 2023)
+# Measured: ~200 nJ/bit. Using sender-only charging (E_rx=0).
+WIFI = PHYProfile("wifi", B=20_000_000.0, P_tx=1.5, N0=1e-13, E_tx_per_bit=2e-7, E_rx_per_bit=0)
 
 REF_DIST = 100.0
 
@@ -100,16 +105,42 @@ calibrate_beta0(WIFI, target_snr_dB=0.0)
 
 
 # ==========================================
-# MQTT FRAME SIZES
+# MQTT FRAME SIZES (WiFi vs ZigBee)
 # ==========================================
 
-def mqtt_frame_size(payload_bytes: int, qos: int) -> int:
+# ZigBee-specific overhead (802.15.4)
+ZIGBEE_L2_OVERHEAD = 15  # IEEE 802.15.4 MAC overhead (no TCP/IP for sensors)
+
+
+def mqtt_frame_size_wifi(payload_bytes: int, qos: int) -> int:
+    """MQTT frame size for WiFi links (UAV↔UAV, UAV→Sink)"""
     mqtt_header = 2 + 2 + MQTT_TOPIC_LEN + (2 if qos > 0 else 0)
     return TCP_IP_OVERHEAD + L2_OVERHEAD + mqtt_header + payload_bytes
 
 
-def mqtt_puback_size() -> int:
+def mqtt_frame_size_zigbee(payload_bytes: int, qos: int) -> int:
+    """MQTT frame size for ZigBee links (IoT/Sensor→UAV)"""
+    mqtt_header = 2 + 2 + MQTT_TOPIC_LEN + (2 if qos > 0 else 0)
+    return ZIGBEE_L2_OVERHEAD + mqtt_header + payload_bytes
+
+
+def mqtt_puback_size_wifi() -> int:
+    """PUBACK size for WiFi links"""
     return TCP_IP_OVERHEAD + L2_OVERHEAD + 4
+
+
+def mqtt_puback_size_zigbee() -> int:
+    """PUBACK size for ZigBee links"""
+    return ZIGBEE_L2_OVERHEAD + 4
+
+
+# Legacy alias (defaults to WiFi)
+def mqtt_frame_size(payload_bytes: int, qos: int) -> int:
+    return mqtt_frame_size_wifi(payload_bytes, qos)
+
+
+def mqtt_puback_size() -> int:
+    return mqtt_puback_size_wifi()
 
 
 # ==========================================
@@ -125,9 +156,10 @@ class BaselineMessage:
     hop_count: int  # Will always be 0 or 1 in baseline
     payload: bytes
     qos: int
+    payload_bytes: int = PhyConst.WIFI_DATA_PAYLOAD_BYTES  # 64B for sensors, 256B for UAV data
 
     def payload_size(self) -> int:
-        return PhyConst.DATA_PAYLOAD_BYTES
+        return self.payload_bytes
 
 
 class MQTTTransmission:
@@ -136,7 +168,14 @@ class MQTTTransmission:
         if rate_bps < prof.B:
             return False, 0.0, 0.0, 0
 
-        frame_bytes = mqtt_frame_size(msg.payload_size(), msg.qos)
+        # Use correct frame size based on link type
+        if prof.name == "zigbee":
+            frame_bytes = mqtt_frame_size_zigbee(msg.payload_size(), msg.qos)
+            # ZigBee max frame constraint
+            if frame_bytes > ZIGBEE_MAX_FRAME:
+                return False, 0.0, 0.0, 0
+        else:
+            frame_bytes = mqtt_frame_size_wifi(msg.payload_size(), msg.qos)
         bits = frame_bytes * 8
         tx_energy = bits * prof.E_tx_per_bit
         rx_energy = bits * prof.E_rx_per_bit
@@ -147,7 +186,11 @@ class MQTTTransmission:
         if rate_bps < prof.B:
             return False, 0.0, 0.0, 0
 
-        ack_bytes = mqtt_puback_size()
+        # Use correct PUBACK size based on link type
+        if prof.name == "zigbee":
+            ack_bytes = mqtt_puback_size_zigbee()
+        else:
+            ack_bytes = mqtt_puback_size_wifi()
         bits = ack_bytes * 8
         tx_energy = bits * prof.E_tx_per_bit
         rx_energy = bits * prof.E_rx_per_bit
@@ -179,22 +222,26 @@ class BaselineUAVAgent:
     def move(self, dt: float):
         if self.is_sink:
             return
-        self._waypoint_timer -= dt
-        if self._waypoint_timer <= 0:
-            self._waypoint_timer = random.uniform(5.0, 15.0)
-            target = np.array([random.uniform(100, self.area_size-100), 
-                              random.uniform(100, self.area_size-100), PhyConst.H])
-            direction = target - self.pos
-            norm = np.linalg.norm(direction[:2])
-            speed = random.uniform(5.0, 15.0)
-            if norm > 1.0:
-                self.vel[:2] = (direction[:2] / norm) * speed
+        
+        # Random waypoint mobility (matching spray_focus_DDS.py)
+        if not hasattr(self, 'waypoints') or not self.waypoints:
+            self.waypoints = [np.array([random.uniform(100, self.area_size-100), 
+                                        random.uniform(100, self.area_size-100), 
+                                        PhyConst.H]) for _ in range(5)]
+        
+        speed = 20.0  # Fixed 20 m/s (matching S&F simulations)
+        target = self.waypoints[0]
+        direction = target - self.pos
+        dist = np.linalg.norm(direction)
+        step = speed * dt
+        
+        if dist <= step:
+            self.pos = target.copy()
+            self.waypoints.pop(0)
+        else:
+            self.pos += (direction / dist) * step
 
-        self.pos += self.vel * dt
-        self.pos[0] = np.clip(self.pos[0], 0, self.area_size)
-        self.pos[1] = np.clip(self.pos[1], 0, self.area_size)
-
-        flight_power = self.flight_power(np.linalg.norm(self.vel[:2]))
+        flight_power = self.flight_power(speed)
         self.energy -= flight_power * dt
 
     def flight_power(self, velocity: float) -> float:
@@ -356,7 +403,7 @@ def run_baseline_simulation(config: dict, verbose: bool = False) -> dict:
             if not sensor_queues[s]:
                 continue
             
-            best_uav = min(range(1, NUM_UAVS), key=lambda k: np.linalg.norm(agents[k].pos - src_pos))
+            best_uav = min(range(NUM_UAVS), key=lambda k: np.linalg.norm(agents[k].pos - src_pos))
             rate, d, prof = link_rate(src_pos, agents[best_uav].pos, is_ground_to_uav=True)
             
             if rate < prof.B:
@@ -368,11 +415,12 @@ def run_baseline_simulation(config: dict, verbose: bool = False) -> dict:
             msg_id, qos_val, t0 = sensor_queues[s][0]
             temp_msg = BaselineMessage(
                 msg_id=msg_id, source_id=s, creation_time=t0,
-                hop_count=0, payload=b"SENSOR_DATA", qos=qos_val
+                hop_count=0, payload=b"SENSOR_DATA", qos=qos_val,
+                payload_bytes=PhyConst.SENSOR_PAYLOAD_BYTES  # 64B for ZigBee sensors
             )
             
             max_bytes_this_step = (rate * dt) / 8.0
-            frame_bytes = mqtt_frame_size(temp_msg.payload_size(), temp_msg.qos)
+            frame_bytes = mqtt_frame_size_zigbee(temp_msg.payload_size(), temp_msg.qos)
             if frame_bytes > max_bytes_this_step:
                 if qos_val == 0:
                     sensor_queues[s].pop(0)

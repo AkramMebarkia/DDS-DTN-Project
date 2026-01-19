@@ -7,7 +7,7 @@ Experiments:
 3. Message Size: Vary DATA_PAYLOAD_BYTES [64, 128, 256, 512]
 4. Sink Mobility: SINK_MOBILE [True, False]
 
-Each experiment runs all 6 protocols 10 times with 95% CI.
+Each experiment runs all 8 protocols 10 times with 95% CI.
 """
 
 import sys
@@ -19,6 +19,7 @@ from datetime import datetime
 from typing import Dict, List, Any
 
 sys.path.insert(0, 'c:/Users/akrem/OneDrive - KFUPM/Desktop/Fastdds_Python')
+import zlib  # For stable hash
 
 # ==========================================
 # CONFIGURATION
@@ -32,8 +33,8 @@ BASELINE = {
     "NUM_SENSORS": 6,
     "DURATION": 1500.0,
     "INITIAL_TOKENS": 10,
-    "AREA_SIZE": 500,
-    "SINK_MOBILE": True,
+    "AREA_SIZE": 500,  # Dense network with static sink to show S&F routing benefit
+    "SINK_MOBILE": False,  # Static sink at center - forces multi-hop delivery
     "WIFI_PAYLOAD_BYTES": 256,  # Only affects WiFi (UAV↔UAV, UAV→Sink)
     "GLOBAL_QOS": 1,
     "NUM_SINKS": 1
@@ -83,17 +84,26 @@ def run_mqtt_enhanced(config: dict) -> dict:
         m.PhyConst.WIFI_DATA_PAYLOAD_BYTES = config["WIFI_PAYLOAD_BYTES"]
     
     AREA_SIZE = config.get("AREA_SIZE", 500)
+    SINK_MOBILE = config.get("SINK_MOBILE", True)  # Match baseline behavior
     duration = config.get("DURATION", 1500.0)
     dt = 0.1
     
+    # Sink: mobile or static at center (matching BASELINE_MQTT)
     agents = {}
-    agents[m.SINK_ID] = m.MqttUAVAgent(m.SINK_ID, [250.0, 250.0, m.PhyConst.H], is_sink=True, area_size=AREA_SIZE)
+    if SINK_MOBILE:
+        sink_pos = [random.uniform(100, AREA_SIZE-100), random.uniform(100, AREA_SIZE-100), m.PhyConst.H]
+        agents[m.SINK_ID] = m.MqttUAVAgent(m.SINK_ID, sink_pos, is_sink=False, area_size=AREA_SIZE)
+    else:
+        sink_pos = [AREA_SIZE/2, AREA_SIZE/2, m.PhyConst.H]
+        agents[m.SINK_ID] = m.MqttUAVAgent(m.SINK_ID, sink_pos, is_sink=True, area_size=AREA_SIZE)
+    
     for i in range(1, m.NUM_UAVS):
         agents[i] = m.MqttUAVAgent(i, [random.uniform(50, AREA_SIZE-50), 
                                        random.uniform(50, AREA_SIZE-50), m.PhyConst.H], area_size=AREA_SIZE)
     
+    # Spread sensors across the area proportionally
     iot_nodes = [
-        np.array([100 + (i % 7) * 60, 100 + (i // 7) * 60, 10.0])
+        np.array([100 + (i % 7) * (AREA_SIZE-200)/6, 100 + (i // 7) * (AREA_SIZE-200)/6, 10.0])
         for i in range(m.NUM_SENSORS)
     ]
     
@@ -108,6 +118,10 @@ def run_mqtt_enhanced(config: dict) -> dict:
     focus_events = 0
     latencies = []
     hop_counts = []
+    
+    # Energy tracking (to match baseline)
+    sensor_tx_energy = 0.0
+    sensor_rx_energy = 0.0
     
     while sim_time < duration:
         sim_time += dt
@@ -315,36 +329,81 @@ def run_mqtt_enhanced(config: dict) -> dict:
                 if msg in ai.buffer:
                     ai.buffer.remove(msg)
         
+        # SENSOR → UAV UPLOAD (bandwidth-limited with energy accounting)
         for s, src_pos in enumerate(iot_nodes):
             if not sensor_queues[s]:
                 continue
-            best_uav = min(range(1, m.NUM_UAVS), 
+            best_uav = min(range(m.NUM_UAVS), 
                           key=lambda k: np.linalg.norm(agents[k].pos - src_pos))
             rate, d, prof = m.link_rate(src_pos, agents[best_uav].pos, is_ground_to_uav=True)
+            
             if rate < prof.B:
+                # Link down - QoS 0 drops, QoS 1 retries
                 if sensor_queues[s][0][1] == 0:
                     sensor_queues[s].pop(0)
                 continue
             
             msg_id, qos_val, t0 = sensor_queues[s][0]
-            if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
-                sensor_queues[s].pop(0)
-                new_msg = m.SprayMessage(
-                    msg_id=msg_id, source_id=s, creation_time=t0,
-                    hop_count=0, tokens=m.INITIAL_TOKENS, 
-                    payload=b"DATA", qos=qos_val
-                )
-                agents[best_uav].buffer.append(new_msg)
-                agents[best_uav].seen_msgs.add(msg_id)
+            
+            # Bandwidth capacity check
+            max_bytes_this_step = (rate * dt) / 8.0
+            frame_bytes = m.mqtt_frame_size_zigbee(m.PhyConst.SENSOR_PAYLOAD_BYTES, qos_val)
+            
+            if frame_bytes > max_bytes_this_step:
+                # Not enough capacity this timestep
+                if qos_val == 0:
+                    sensor_queues[s].pop(0)  # QoS 0: drop
+                continue
+            
+            # Energy accounting: Sensor TX (ZigBee)
+            bits = frame_bytes * 8
+            tx_e = bits * prof.E_tx_per_bit
+            rx_e = bits * prof.E_rx_per_bit
+            sensor_tx_energy += tx_e
+            agents[best_uav].radio_rx_energy += rx_e
+            
+            # PUBACK energy for QoS 1
+            if qos_val == 1:
+                puback_bytes = m.mqtt_puback_size_zigbee()
+                puback_bits = puback_bytes * 8
+                agents[best_uav].radio_tx_energy += puback_bits * prof.E_tx_per_bit
+                sensor_rx_energy += puback_bits * prof.E_rx_per_bit
+            
+            # CRITICAL FIX: If sink collects directly, count as instant delivery (like BASELINE)
+            if best_uav == m.SINK_ID:
+                sensor_queues[s].pop(0)  # Pop AFTER successful handling
+                if msg_id not in agents[m.SINK_ID].seen_msgs:
+                    agents[m.SINK_ID].seen_msgs.add(msg_id)
+                    total_delivered += 1
+                    hop_counts.append(0)  # Direct collection = 0 hops
+                    latencies.append(sim_time - t0)
+            else:
+                # Regular UAV: put in buffer for S&F routing
+                if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
+                    sensor_queues[s].pop(0)  # Pop AFTER successful buffer insertion
+                    temp_msg = m.SprayMessage(
+                        msg_id=msg_id, source_id=s, creation_time=t0,
+                        hop_count=0, tokens=m.INITIAL_TOKENS, 
+                        payload=b"DATA", qos=qos_val,
+                        payload_bytes=m.PhyConst.SENSOR_PAYLOAD_BYTES
+                    )
+                    agents[best_uav].buffer.append(temp_msg)
+                    agents[best_uav].seen_msgs.add(msg_id)
+                else:
+                    # Buffer full - QoS0 drops, QoS1 stays for retry (like BASELINE)
+                    if qos_val == 0:
+                        sensor_queues[s].pop(0)
     
     total_uav_radio = sum(a.radio_tx_energy + a.radio_rx_energy for a in agents.values())
+    total_sensor_energy = sensor_tx_energy + sensor_rx_energy
+    total_radio_energy = total_uav_radio + total_sensor_energy
     overhead = (spray_events + focus_events + total_delivered) / max(1, total_delivered)
     
     return {
         "pdr": 100.0 * total_delivered / max(1, total_generated),
         "avg_latency": float(np.mean(latencies)) if latencies else 0.0,
         "median_latency": float(np.median(latencies)) if latencies else 0.0,
-        "energy_per_msg_mJ": (total_uav_radio / max(1, total_delivered)) * 1000,
+        "energy_per_msg_mJ": (total_radio_energy / max(1, total_delivered)) * 1000,
         "avg_hops": float(np.mean(hop_counts)) if hop_counts else 0.0,
         "total_delivered": total_delivered,
         "spray_events": spray_events,
@@ -369,12 +428,18 @@ def run_dds_multisink(config: dict) -> dict:
     return run_multisink_simulation(config, verbose=False)
 
 
-# Standard protocols (1 sink)
+# Standard protocols (1 sink) - 8 variants
 PROTOCOLS = [
-    {"name": "MQTT_Baseline", "qos": 1, "runner": run_mqtt_baseline, "label": "MQTT Baseline"},
-    {"name": "MQTT_SF", "qos": 1, "runner": run_mqtt_enhanced, "label": "MQTT S&F"},
-    {"name": "Vanilla_DDS", "qos": 1, "runner": run_vanilla_dds, "label": "Vanilla DDS"},
-    {"name": "DDS_SF", "qos": 1, "runner": run_dds_spray_focus, "label": "DDS S&F"}
+    # MQTT protocols (QoS 0 = Best Effort, QoS 1 = Reliable with PUBACK)
+    {"name": "MQTT_Baseline_QoS0", "qos": 0, "runner": run_mqtt_baseline, "label": "MQTT Baseline QoS0"},
+    {"name": "MQTT_Baseline_QoS1", "qos": 1, "runner": run_mqtt_baseline, "label": "MQTT Baseline QoS1"},
+    {"name": "MQTT_SF_QoS0", "qos": 0, "runner": run_mqtt_enhanced, "label": "MQTT S&F QoS0"},
+    {"name": "MQTT_SF_QoS1", "qos": 1, "runner": run_mqtt_enhanced, "label": "MQTT S&F QoS1"},
+    # DDS protocols (QoS 0 = Best Effort, QoS 1 = Reliable with ACKNACK)
+    {"name": "Vanilla_DDS_BE", "qos": 0, "runner": run_vanilla_dds, "label": "Vanilla DDS BE"},
+    {"name": "Vanilla_DDS_Rel", "qos": 1, "runner": run_vanilla_dds, "label": "Vanilla DDS Rel"},
+    {"name": "DDS_SF_BE", "qos": 0, "runner": run_dds_spray_focus, "label": "DDS S&F BE"},
+    {"name": "DDS_SF_Rel", "qos": 1, "runner": run_dds_spray_focus, "label": "DDS S&F Rel"}
 ]
 
 # Multi-sink protocol (used only for NUM_SINKS sweep)
@@ -429,9 +494,9 @@ def run_experiment_set(param_name: str, param_values: list, output_prefix: str):
             for run in range(NUM_RUNS):
                 print_progress(run + 1, NUM_RUNS, proto["label"])
                 
-                seed = run * 1000 + hash(str(val)) % 1000
-                random.seed(seed)
-                np.random.seed(seed)
+                # seed = run * 1000 + zlib.crc32(str(val).encode()) % 10000
+                # random.seed(seed)
+                # np.random.seed(seed)
                 
                 try:
                     result = proto["runner"](config)

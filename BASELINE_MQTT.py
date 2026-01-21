@@ -280,8 +280,8 @@ def run_baseline_simulation(config: dict, verbose: bool = False) -> dict:
     AREA_SIZE = config.get("AREA_SIZE", 500)  # 500x500m to match enhanced
     SINK_MOBILE = config.get("SINK_MOBILE", True)  # Mobile sink by default
     
-    if "DATA_PAYLOAD_BYTES" in config:
-        PhyConst.DATA_PAYLOAD_BYTES = config["DATA_PAYLOAD_BYTES"]
+    if "WIFI_PAYLOAD_BYTES" in config:
+        PhyConst.WIFI_DATA_PAYLOAD_BYTES = config["WIFI_PAYLOAD_BYTES"]
     
     duration = config.get("DURATION", 1500.0)
     dt = 0.1

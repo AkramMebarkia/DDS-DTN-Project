@@ -1163,8 +1163,8 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
     AREA_SIZE = config.get("AREA_SIZE", 750)  # Default to 750m (matching sweep baseline)
     
     # Apply payload size
-    if "DATA_PAYLOAD_BYTES" in config:
-        PhyConst.DATA_PAYLOAD_BYTES = config["DATA_PAYLOAD_BYTES"]
+    if "WIFI_PAYLOAD_BYTES" in config:
+        PhyConst.WIFI_DATA_PAYLOAD_BYTES = config["WIFI_PAYLOAD_BYTES"]
     
     duration = config.get("DURATION", 1500.0)  # Match sweep duration
     dt = 0.1

@@ -101,8 +101,9 @@ def run_dds_spray_focus(config: dict) -> dict:
 
 def run_dds_multisink(config: dict) -> dict:
     """Multi-sink DDS S&F simulation"""
-    from spray_focus_DDS_multisink import run_multisink_simulation
-    return run_multisink_simulation(config, verbose=False)
+    # from spray_focus_DDS_multisink import run_multisink_simulation
+    # return run_multisink_simulation(config, verbose=False)
+    raise NotImplementedError("spray_focus_DDS_multisink module is missing")
 
 
 # Standard protocols (1 sink) - 8 variants

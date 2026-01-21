@@ -570,9 +570,9 @@ def plot_load_sensors(data: pd.DataFrame, registry: Dict[str, ProtoStyle]) -> No
     )
 
 def plot_payload_effects(data: pd.DataFrame, registry: Dict[str, ProtoStyle]) -> None:
-    payload_data = data[data["param_name"] == "DATA_PAYLOAD_BYTES"]
+    payload_data = data[data["param_name"] == "WIFI_PAYLOAD_BYTES"]
     if payload_data.empty:
-        print("⚠️ No DATA_PAYLOAD_BYTES data")
+        print("⚠️ No WIFI_PAYLOAD_BYTES data")
         return
 
     plot_line_sweep_q1(

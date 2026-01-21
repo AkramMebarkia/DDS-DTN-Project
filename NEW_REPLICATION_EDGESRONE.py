@@ -626,7 +626,8 @@ def run_mqtt_simulation():
                             hop_count=msg.hop_count + 1,
                             tokens=send_tokens,
                             payload=msg.payload,
-                            qos=msg.qos
+                            qos=msg.qos,
+                            payload_bytes=msg.payload_bytes  # CRITICAL: Preserve original payload size
                         )
                         aj.buffer.append(new_msg)
                         aj.seen_msgs.add(msg.msg_id)
@@ -774,7 +775,8 @@ def run_mqtt_simulation():
                                     hop_count=msg.hop_count + 1,
                                     tokens=1,
                                     payload=msg.payload,
-                                    qos=msg.qos
+                                    qos=msg.qos,
+                                    payload_bytes=msg.payload_bytes  # CRITICAL: Preserve original payload size
                                 )
                                 aj.buffer.append(new_msg)
                                 aj.seen_msgs.add(msg.msg_id)
@@ -1157,54 +1159,64 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
     INITIAL_TOKENS = config.get("INITIAL_TOKENS", 10)
     GLOBAL_QOS = config.get("GLOBAL_QOS", 1)
     
-    # Area size (larger for more realistic comparison)
-    AREA_SIZE = config.get("AREA_SIZE", 1000)  # 1000x1000m by default
-    
-    # Option B: Sinks are separate from mobile UAVs
-    # Mobile UAVs: 0 to NUM_UAVS-1
-    # Sinks: NUM_UAVS to NUM_UAVS+NUM_SINKS-1
-    TOTAL_NODES = NUM_UAVS + NUM_SINKS
-    SINK_IDS = list(range(NUM_UAVS, TOTAL_NODES))  # e.g., [8, 9, 10] if NUM_UAVS=8, NUM_SINKS=3
+    # Area size
+    AREA_SIZE = config.get("AREA_SIZE", 750)  # Default to 750m (matching sweep baseline)
     
     # Apply payload size
     if "DATA_PAYLOAD_BYTES" in config:
         PhyConst.DATA_PAYLOAD_BYTES = config["DATA_PAYLOAD_BYTES"]
     
-    duration = config.get("DURATION", 560.0)
+    duration = config.get("DURATION", 1500.0)  # Match sweep duration
     dt = 0.1
     
-    # ---- Initialize Mobile UAVs (with configurable area) ----
-    agents: Dict[int, MqttUAVAgent] = {}
-    for i in range(NUM_UAVS):
-        agents[i] = MqttUAVAgent(i, [random.uniform(100, AREA_SIZE-100), random.uniform(100, AREA_SIZE-100), PhyConst.H], area_size=AREA_SIZE)
+    # ---- Single-sink mode (default, matching sweep behavior) ----
+    # SINK_ID = 0, Mobile UAVs = 1 to NUM_UAVS-1
+    SINK_ID = 0
+    SINK_IDS = [SINK_ID]
     
-    # ---- Initialize Sinks ----
-    # Distribute sinks across the area
-    sink_positions = [
-        [AREA_SIZE/2, AREA_SIZE/2, PhyConst.H],  # Center
-        [AREA_SIZE/4, AREA_SIZE/4, PhyConst.H],  # Bottom-left quadrant
-        [3*AREA_SIZE/4, AREA_SIZE/4, PhyConst.H],  # Bottom-right quadrant
-        [AREA_SIZE/4, 3*AREA_SIZE/4, PhyConst.H],  # Top-left quadrant
-        [3*AREA_SIZE/4, 3*AREA_SIZE/4, PhyConst.H],  # Top-right quadrant
-    ]
-    for idx, sink_id in enumerate(SINK_IDS):
-        pos = sink_positions[idx % len(sink_positions)]
-        if SINK_MOBILE:
-            # Mobile sink: random starting position like other UAVs
-            pos = [random.uniform(100, AREA_SIZE-100), random.uniform(100, AREA_SIZE-100), PhyConst.H]
-        agents[sink_id] = MqttUAVAgent(sink_id, pos, is_sink=True, area_size=AREA_SIZE)
-
-    # ---- Initialize Ground IoT nodes (spread across larger area) ----
-    iot_nodes = [
-        np.array([100 + (i % 7) * (AREA_SIZE-200)/6, 100 + (i // 7) * (AREA_SIZE-200)/6, 10.0])
-        for i in range(NUM_SENSORS)
-    ]
+    agents: Dict[int, MqttUAVAgent] = {}
+    
+    # Initialize sink (UAV 0)
+    if SINK_MOBILE:
+        sink_pos = [random.uniform(100, AREA_SIZE-100), random.uniform(100, AREA_SIZE-100), PhyConst.H]
+        agents[SINK_ID] = MqttUAVAgent(SINK_ID, sink_pos, is_sink=False, area_size=AREA_SIZE)
+    else:
+        sink_pos = [AREA_SIZE/2, AREA_SIZE/2, PhyConst.H]
+        agents[SINK_ID] = MqttUAVAgent(SINK_ID, sink_pos, is_sink=True, area_size=AREA_SIZE)
+    
+    # Initialize mobile UAVs (1 to NUM_UAVS-1)
+    for i in range(1, NUM_UAVS):
+        agents[i] = MqttUAVAgent(i, [random.uniform(50, AREA_SIZE-50), 
+                                     random.uniform(50, AREA_SIZE-50), PhyConst.H], area_size=AREA_SIZE)
+    
+    # ---- Initialize Ground IoT nodes (well-spaced positions) ----
+    def generate_spread_sensors(num_sensors, area_size, seed=42):
+        """Generate well-spaced sensor positions."""
+        rng = np.random.RandomState(seed)
+        margin = 100
+        min_dist = (area_size - 2 * margin) / (num_sensors ** 0.5 + 1)
+        positions = []
+        for _ in range(num_sensors):
+            for attempt in range(1000):
+                x = rng.uniform(margin, area_size - margin)
+                y = rng.uniform(margin, area_size - margin)
+                valid = True
+                for px, py, _ in positions:
+                    if np.sqrt((x - px)**2 + (y - py)**2) < min_dist:
+                        valid = False
+                        break
+                if valid or attempt == 999:
+                    positions.append([x, y, 10.0])
+                    break
+        return [np.array(pos) for pos in positions]
+    
+    iot_nodes = generate_spread_sensors(NUM_SENSORS, AREA_SIZE, seed=42)
 
     # ---- Simulation parameters ----
     sim_time = 0.0
 
     # ---- Sensor queues ----
-    SENSOR_RATE = 1.0
+    SENSOR_RATE = 0.5  # Match sweep baseline (was 1.0)
     SENSOR_BUF_MAX = 50
     sensor_queues: List[List[Tuple[int, int, float]]] = [[] for _ in range(NUM_SENSORS)]
     MSG_COUNTER = 0
@@ -1281,11 +1293,15 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
 
         # 3) SPRAY & FOCUS ROUTING (between mobile UAVs only)
         for i in range(NUM_UAVS):
+            if i in SINK_IDS:
+                continue  # Sink doesn't spray
             ai = agents[i]
             if not ai.buffer:
                 continue
             
             for j in range(NUM_UAVS):
+                if j == i or j in SINK_IDS:
+                    continue  # Don't spray to self or sink (sink handled in Step 4)
                 if j == i:
                     continue
                 aj = agents[j]
@@ -1336,7 +1352,8 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
                     new_msg = SprayMessage(
                         msg_id=msg.msg_id, source_id=msg.source_id,
                         creation_time=msg.creation_time, hop_count=msg.hop_count + 1,
-                        tokens=send_tokens, payload=msg.payload, qos=msg.qos
+                        tokens=send_tokens, payload=msg.payload, qos=msg.qos,
+                        payload_bytes=msg.payload_bytes  # CRITICAL: Preserve original payload size
                     )
                     aj.buffer.append(new_msg)
                     aj.seen_msgs.add(msg.msg_id)
@@ -1442,7 +1459,8 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
                             new_msg = SprayMessage(
                                 msg_id=msg.msg_id, source_id=msg.source_id,
                                 creation_time=msg.creation_time, hop_count=msg.hop_count + 1,
-                                tokens=1, payload=msg.payload, qos=msg.qos
+                                tokens=1, payload=msg.payload, qos=msg.qos,
+                                payload_bytes=msg.payload_bytes  # CRITICAL: Preserve original payload size
                             )
                             aj.buffer.append(new_msg)
                             aj.seen_msgs.add(msg.msg_id)
@@ -1458,6 +1476,8 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
             all_delivered_ids.update(agents[sid].seen_msgs)
         
         for i in range(NUM_UAVS):
+            if i in SINK_IDS:
+                continue
             ai = agents[i]
             if not ai.buffer:
                 continue
@@ -1551,20 +1571,34 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
                 continue
 
             success, tx_e, rx_e, _ = MQTTTransmission.transmit_data(rate, prof, temp_msg)
-            if success and len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
-                sensor_queues[s].pop(0)
-                agents[best_uav].buffer.append(temp_msg)
-                agents[best_uav].seen_msgs.add(msg_id)
+            if success:
+                # Energy update
                 sensor_tx_energy += tx_e
                 agents[best_uav].energy -= rx_e
                 agents[best_uav].radio_rx_energy += rx_e
-
+                
                 if qos_val == 1:
                     succ_ack, tx_ack, rx_ack, _ = MQTTTransmission.transmit_puback(rate, prof)
                     if succ_ack:
                         agents[best_uav].energy -= tx_ack
                         agents[best_uav].radio_tx_energy += tx_ack
                         sensor_rx_energy += rx_ack
+
+                sensor_queues[s].pop(0)
+                
+                # Direct Sink Delivery Check
+                if best_uav in SINK_IDS:
+                    if msg_id not in agents[best_uav].seen_msgs:
+                        agents[best_uav].seen_msgs.add(msg_id)
+                        all_delivered_ids.add(msg_id)
+                        total_delivered += 1
+                        hop_counts.append(0)
+                        latencies.append(sim_time - t0)
+                else:
+                    # Regular UAV: Add to buffer
+                    if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
+                        agents[best_uav].buffer.append(temp_msg)
+                        agents[best_uav].seen_msgs.add(msg_id)
             else:
                 if qos_val == 0:
                     sensor_queues[s].pop(0)
@@ -1587,6 +1621,8 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
         "total_generated": total_generated,
         "total_delivered": total_delivered,
         "uav_relay_events": uav_relay_events,
+        "spray_events": spray_events,
+        "focus_events": focus_events,
         "sink_delivery_events": sink_delivery_events,
         "control_messages_sent": control_messages_sent,
         "control_energy": total_control_energy,

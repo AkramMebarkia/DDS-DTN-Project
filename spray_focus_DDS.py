@@ -531,12 +531,35 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
                                             random.uniform(100, AREA_SIZE-100), PhyConst.H],
                                         reliable=RELIABLE, area_size=AREA_SIZE)
     
-    # Sensors
-    iot_nodes = [
-        np.array([100 + (i % 7) * (AREA_SIZE-200)/6, 
-                  100 + (i // 7) * (AREA_SIZE-200)/6, 10.0])
-        for i in range(NUM_SENSORS)
-    ]
+    # Initialize sensors with well-spaced random positions (reproducible)
+    def generate_spread_sensors(num_sensors, area_size, seed=42):
+        """Generate well-spaced sensor positions using seeded random with minimum distance."""
+        rng = np.random.RandomState(seed)
+        margin = 100  # Keep sensors away from edges
+        min_dist = (area_size - 2 * margin) / (num_sensors ** 0.5 + 1)  # Minimum spacing
+        
+        positions = []
+        max_attempts = 1000
+        
+        for _ in range(num_sensors):
+            for attempt in range(max_attempts):
+                x = rng.uniform(margin, area_size - margin)
+                y = rng.uniform(margin, area_size - margin)
+                
+                # Check distance from all existing sensors
+                valid = True
+                for px, py, _ in positions:
+                    if np.sqrt((x - px)**2 + (y - py)**2) < min_dist:
+                        valid = False
+                        break
+                
+                if valid or attempt == max_attempts - 1:
+                    positions.append([x, y, 10.0])  # z=10m ground level
+                    break
+        
+        return [np.array(pos) for pos in positions]
+    
+    iot_nodes = generate_spread_sensors(NUM_SENSORS, AREA_SIZE, seed=42)
     
     sim_time = 0.0
     SENSOR_RATE = 0.5

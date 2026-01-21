@@ -597,6 +597,35 @@ def plot_payload_effects(data: pd.DataFrame, registry: Dict[str, ProtoStyle]) ->
         registry, legend_ncol=2
     )
 
+def plot_area_size_effects(data: pd.DataFrame, registry: Dict[str, ProtoStyle]) -> None:
+    """Network density sweep: larger area = sparser network."""
+    area_data = data[data["param_name"] == "AREA_SIZE"]
+    if area_data.empty:
+        print("⚠️ No AREA_SIZE data")
+        return
+
+    plot_line_sweep_q1(
+        area_data, "param_value", "pdr_mean", "pdr_ci95", "protocol",
+        "Area Size (m)", "PDR (%)",
+        "Network Density: PDR vs Area Size",
+        "plot17_pdr_vs_area.pdf",
+        registry, legend_ncol=2
+    )
+    plot_line_sweep_q1(
+        area_data, "param_value", "avg_latency_mean", "avg_latency_ci95", "protocol",
+        "Area Size (m)", "Average Latency (s)",
+        "Network Density: Latency vs Area Size",
+        "plot18_latency_vs_area.pdf",
+        registry, legend_ncol=2
+    )
+    plot_line_sweep_q1(
+        area_data, "param_value", "energy_per_msg_mJ_mean", "energy_per_msg_mJ_ci95", "protocol",
+        "Area Size (m)", "Energy per Message (mJ)",
+        "Network Density: Energy vs Area Size",
+        "plot19_energy_vs_area.pdf",
+        registry, legend_ncol=2
+    )
+
 
 # =============================================================================
 # SECTION 4: DISTRIBUTIONS / OVERHEAD
@@ -880,7 +909,7 @@ def generate_all_plots(
 
     if sweep_csvs is None:
         sweep_csvs = {}
-        for param in ["NUM_UAVS", "NUM_SENSORS", "DATA_PAYLOAD_BYTES", "SINK_MOBILE"]:
+        for param in ["NUM_UAVS", "NUM_SENSORS", "DATA_PAYLOAD_BYTES", "SINK_MOBILE", "AREA_SIZE"]:
             param_files = [f for f in csv_files if param in f]
             if param_files:
                 sweep_csvs[param] = sorted(param_files)[-1]
@@ -940,9 +969,10 @@ def generate_all_plots(
         plot_load_sensors(combined_sweep, registry)
 
         print("-" * 72)
-        print("\n📊 SECTION 3: Payload Size Effects")
+        print("\n📊 SECTION 3: Payload Size & Network Density Effects")
         print("-" * 72)
         plot_payload_effects(combined_sweep, registry)
+        plot_area_size_effects(combined_sweep, registry)
 
         print("-" * 72)
         print("\n📊 Sink Mobility Comparison")

@@ -416,11 +416,35 @@ def run_mqtt_simulation():
     for i in range(1, NUM_UAVS):
         agents[i] = MqttUAVAgent(i, [random.uniform(50, 450), random.uniform(50, 450), PhyConst.H])
 
-    # ---- Initialize Ground IoT nodes ----
-    iot_nodes = [
-        np.array([100 + (i % 7) * 60, 100 + (i // 7) * 60, 10.0])
-        for i in range(NUM_SENSORS)
-    ]
+    # ---- Initialize Ground IoT nodes with well-spaced random positions ----
+    def generate_spread_sensors(num_sensors, area_size, seed=42):
+        """Generate well-spaced sensor positions using seeded random with minimum distance."""
+        rng = np.random.RandomState(seed)
+        margin = 100  # Keep sensors away from edges
+        min_dist = (area_size - 2 * margin) / (num_sensors ** 0.5 + 1)  # Minimum spacing
+        
+        positions = []
+        max_attempts = 1000
+        
+        for _ in range(num_sensors):
+            for attempt in range(max_attempts):
+                x = rng.uniform(margin, area_size - margin)
+                y = rng.uniform(margin, area_size - margin)
+                
+                # Check distance from all existing sensors
+                valid = True
+                for px, py, _ in positions:
+                    if np.sqrt((x - px)**2 + (y - py)**2) < min_dist:
+                        valid = False
+                        break
+                
+                if valid or attempt == max_attempts - 1:
+                    positions.append([x, y, 10.0])  # z=10m ground level
+                    break
+        
+        return [np.array(pos) for pos in positions]
+    
+    iot_nodes = generate_spread_sensors(NUM_SENSORS, 500, seed=42)  # Fixed 500m area for standalone run
 
     # ---- Simulation parameters ----
     sim_time = 0.0
@@ -863,9 +887,9 @@ def run_mqtt_simulation():
                 if not sensor_queues[s]:
                     continue
                 
-                # Find nearest UAV (excluding sink)
+                # Find nearest UAV (including sink)
                 best_uav = min(
-                    range(1, NUM_UAVS),
+                    range(NUM_UAVS),
                     key=lambda k: np.linalg.norm(agents[k].pos - src_pos)
                 )
                 
@@ -881,21 +905,9 @@ def run_mqtt_simulation():
                 
                 msg_id, qos_val, t0 = sensor_queues[s][0]  # Peek head
                 
-                # Create temporary message for transmission
-                temp_msg = SprayMessage(
-                    msg_id=msg_id,
-                    source_id=s,
-                    creation_time=t0,
-                    hop_count=0,
-                    tokens=INITIAL_TOKENS,
-                    payload=b"SENSOR_DATA",
-                    qos=qos_val,
-                    payload_bytes=PhyConst.SENSOR_PAYLOAD_BYTES  # 64B for ZigBee sensors
-                )
-                
                 # Check bandwidth capacity for this timestep
                 max_bytes_this_step = (rate * dt) / 8.0
-                frame_bytes = mqtt_frame_size_zigbee(temp_msg.payload_size(), temp_msg.qos)
+                frame_bytes = mqtt_frame_size_zigbee(PhyConst.SENSOR_PAYLOAD_BYTES, qos_val)
                 
                 if frame_bytes > max_bytes_this_step:
                     # Not enough capacity this timestep
@@ -904,38 +916,59 @@ def run_mqtt_simulation():
                     # QoS 1: retry next timestep
                     continue
                 
-                success, tx_e, rx_e, _ = MQTTTransmission.transmit_data(rate, prof, temp_msg)
+                # Energy accounting: Sensor TX (ZigBee)
+                bits = frame_bytes * 8
+                tx_e = bits * prof.E_tx_per_bit
+                rx_e = bits * prof.E_rx_per_bit
+                sensor_tx_energy += tx_e
+                agents[best_uav].energy -= rx_e
+                agents[best_uav].radio_rx_energy += rx_e
                 
-                if success and len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
-                    # Transmission succeeded
-                    sensor_queues[s].pop(0)
-                    
-                    agents[best_uav].buffer.append(temp_msg)
-                    agents[best_uav].seen_msgs.add(msg_id)
-                    
-                    # Sensor energy accounting
-                    sensor_tx_energy += tx_e
-                    
-                    # UAV receives
-                    agents[best_uav].energy -= rx_e
-                    agents[best_uav].radio_rx_energy += rx_e
-                    
-                    # PUBACK if QoS 1
-                    if qos_val == 1:
-                        succ_ack, tx_ack, rx_ack, _ = MQTTTransmission.transmit_puback(rate, prof)
-                        if succ_ack:
-                            agents[best_uav].energy -= tx_ack
-                            agents[best_uav].radio_tx_energy += tx_ack
-                            sensor_rx_energy += rx_ack
+                # PUBACK energy for QoS 1
+                if qos_val == 1:
+                    puback_bytes = mqtt_puback_size_zigbee()
+                    puback_bits = puback_bytes * 8
+                    agents[best_uav].energy -= puback_bits * prof.E_tx_per_bit
+                    agents[best_uav].radio_tx_energy += puback_bits * prof.E_tx_per_bit
+                    sensor_rx_energy += puback_bits * prof.E_rx_per_bit
                 
+                # CRITICAL FIX: If sink collects directly, count as instant delivery
+                if best_uav == SINK_ID:
+                    sensor_queues[s].pop(0)  # Pop AFTER successful handling
+                    if msg_id not in sink.seen_msgs:
+                        sink.seen_msgs.add(msg_id)
+                        sink.sink_received_count += 1
+                        total_delivered += 1
+                        sink_delivery_events += 1
+                        hop_counts.append(0)  # Direct collection = 0 hops
+                        lat = sim_time - t0
+                        latencies.append(lat)
+                        if qos_val == 0:
+                            total_delivered_qos0 += 1
+                            latencies_qos0.append(lat)
+                        else:
+                            total_delivered_qos1 += 1
+                            latencies_qos1.append(lat)
                 else:
-                    # Transmission failed
-                    if qos_val == 0:
-                        # QoS 0: fire-and-forget, drop message
-                        sensor_queues[s].pop(0)
+                    # Regular UAV: put in buffer for S&F routing
+                    if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
+                        sensor_queues[s].pop(0)  # Pop AFTER successful buffer insertion
+                        temp_msg = SprayMessage(
+                            msg_id=msg_id,
+                            source_id=s,
+                            creation_time=t0,
+                            hop_count=0,
+                            tokens=INITIAL_TOKENS,
+                            payload=b"SENSOR_DATA",
+                            qos=qos_val,
+                            payload_bytes=PhyConst.SENSOR_PAYLOAD_BYTES  # 64B for ZigBee sensors
+                        )
+                        agents[best_uav].buffer.append(temp_msg)
+                        agents[best_uav].seen_msgs.add(msg_id)
                     else:
-                        # QoS 1: keep in queue, retry next time
-                        pass
+                        # Buffer full - QoS0 drops, QoS1 stays for retry
+                        if qos_val == 0:
+                            sensor_queues[s].pop(0)
 
     except KeyboardInterrupt:
         print("\n\nSimulation interrupted by user.")

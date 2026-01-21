@@ -33,7 +33,7 @@ BASELINE = {
     "NUM_SENSORS": 6,
     "DURATION": 1500.0,
     "INITIAL_TOKENS": 10,
-    "AREA_SIZE": 500,  # Dense network with static sink to show S&F routing benefit
+    "AREA_SIZE": 750,  # Sparser network where S&F multi-hop routing shows advantage
     "SINK_MOBILE": False,  # Static sink at center - forces multi-hop delivery
     "WIFI_PAYLOAD_BYTES": 256,  # Only affects WiFi (UAV↔UAV, UAV→Sink)
     "GLOBAL_QOS": 1,
@@ -45,7 +45,8 @@ PARAM_SWEEPS = {
     "NUM_UAVS": [4, 6, 8, 10, 12],
     "NUM_SENSORS": [4, 6, 8, 10, 12],
     "WIFI_PAYLOAD_BYTES": [64, 128, 256, 512],  # Only WiFi links (ZigBee sensor payload is fixed at 64)
-    "SINK_MOBILE": [True, False]
+    "SINK_MOBILE": [True, False],
+    "AREA_SIZE": [500, 750, 1000, 1500]  # Network density sweep
 }
 
 METRICS = [
@@ -77,7 +78,10 @@ def run_mqtt_enhanced(config: dict) -> dict:
     m.GLOBAL_QOS = config.get("GLOBAL_QOS", 1)
     m.NUM_UAVS = config.get("NUM_UAVS", 8)
     m.NUM_SENSORS = config.get("NUM_SENSORS", 6)
-    m.INITIAL_TOKENS = config.get("INITIAL_TOKENS", 10)
+    
+    # CRITICAL: Use local variable to avoid module caching issues
+    INITIAL_TOKENS = config.get("INITIAL_TOKENS", 10)
+    m.INITIAL_TOKENS = INITIAL_TOKENS  # Also set module for any internal references
     
     # Set WiFi payload size from config (for payload sweep - sensor payload stays fixed)
     if "WIFI_PAYLOAD_BYTES" in config:
@@ -101,11 +105,35 @@ def run_mqtt_enhanced(config: dict) -> dict:
         agents[i] = m.MqttUAVAgent(i, [random.uniform(50, AREA_SIZE-50), 
                                        random.uniform(50, AREA_SIZE-50), m.PhyConst.H], area_size=AREA_SIZE)
     
-    # Spread sensors across the area proportionally
-    iot_nodes = [
-        np.array([100 + (i % 7) * (AREA_SIZE-200)/6, 100 + (i // 7) * (AREA_SIZE-200)/6, 10.0])
-        for i in range(m.NUM_SENSORS)
-    ]
+    # Initialize sensors with well-spaced random positions (reproducible)
+    def generate_spread_sensors(num_sensors, area_size, seed=42):
+        """Generate well-spaced sensor positions using seeded random with minimum distance."""
+        rng = np.random.RandomState(seed)
+        margin = 100  # Keep sensors away from edges
+        min_dist = (area_size - 2 * margin) / (num_sensors ** 0.5 + 1)  # Minimum spacing
+        
+        positions = []
+        max_attempts = 1000
+        
+        for _ in range(num_sensors):
+            for attempt in range(max_attempts):
+                x = rng.uniform(margin, area_size - margin)
+                y = rng.uniform(margin, area_size - margin)
+                
+                # Check distance from all existing sensors
+                valid = True
+                for px, py, _ in positions:
+                    if np.sqrt((x - px)**2 + (y - py)**2) < min_dist:
+                        valid = False
+                        break
+                
+                if valid or attempt == max_attempts - 1:
+                    positions.append([x, y, 10.0])  # z=10m ground level
+                    break
+        
+        return [np.array(pos) for pos in positions]
+    
+    iot_nodes = generate_spread_sensors(m.NUM_SENSORS, AREA_SIZE, seed=42)
     
     sim_time = 0.0
     SENSOR_RATE = 0.5
@@ -136,6 +164,11 @@ def run_mqtt_enhanced(config: dict) -> dict:
         
         for agent in agents.values():
             agent.move(dt)
+            # CRITICAL FIX: Age encounter timers (required for focus routing)
+            if hasattr(agent, 'encounter_timers'):
+                for k in agent.encounter_timers.keys():
+                    agent.encounter_timers[k] += dt
+                agent.encounter_timers[agent.id] = 0.0
         
         for i in range(m.NUM_UAVS):
             for j in range(i + 1, m.NUM_UAVS):
@@ -329,6 +362,14 @@ def run_mqtt_enhanced(config: dict) -> dict:
                 if msg in ai.buffer:
                     ai.buffer.remove(msg)
         
+        # CRITICAL FIX: Global Duplicate Purge (matching DDS S&F)
+        if total_delivered > 0 and int(sim_time * 10) % 10 == 0:
+            delivered_ids = sink.seen_msgs.copy()
+            for uid, agent in agents.items():
+                if uid == m.SINK_ID or not agent.buffer:
+                    continue
+                agent.buffer = [msg for msg in agent.buffer if msg.msg_id not in delivered_ids]
+        
         # SENSOR → UAV UPLOAD (bandwidth-limited with energy accounting)
         for s, src_pos in enumerate(iot_nodes):
             if not sensor_queues[s]:
@@ -383,7 +424,7 @@ def run_mqtt_enhanced(config: dict) -> dict:
                     sensor_queues[s].pop(0)  # Pop AFTER successful buffer insertion
                     temp_msg = m.SprayMessage(
                         msg_id=msg_id, source_id=s, creation_time=t0,
-                        hop_count=0, tokens=m.INITIAL_TOKENS, 
+                        hop_count=0, tokens=INITIAL_TOKENS,  # Use local variable
                         payload=b"DATA", qos=qos_val,
                         payload_bytes=m.PhyConst.SENSOR_PAYLOAD_BYTES
                     )
@@ -494,9 +535,10 @@ def run_experiment_set(param_name: str, param_values: list, output_prefix: str):
             for run in range(NUM_RUNS):
                 print_progress(run + 1, NUM_RUNS, proto["label"])
                 
-                # seed = run * 1000 + zlib.crc32(str(val).encode()) % 10000
-                # random.seed(seed)
-                # np.random.seed(seed)
+                # CRITICAL: Seed RNG for reproducibility (different seed per run, but deterministic)
+                seed = run * 1000 + zlib.crc32(str(val).encode()) % 10000
+                random.seed(seed)
+                np.random.seed(seed)
                 
                 try:
                     result = proto["runner"](config)

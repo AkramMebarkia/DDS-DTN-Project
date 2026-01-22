@@ -203,7 +203,7 @@ class MQTTTransmission:
 # ==========================================
 
 class BaselineUAVAgent:
-    MAX_BUFFER = 50
+    MAX_BUFFER = 250
 
     def __init__(self, uid: int, pos: List[float], is_sink: bool = False, area_size: float = 500):
         self.id = uid
@@ -277,7 +277,7 @@ def run_baseline_simulation(config: dict, verbose: bool = False) -> dict:
     SINK_ID = 0
     
     # Area and sink configuration - match enhanced simulation (500x500m)
-    AREA_SIZE = config.get("AREA_SIZE", 500)  # 500x500m to match enhanced
+    AREA_SIZE = config.get("AREA_SIZE", 750)  # 750x750m to match enhanced
     SINK_MOBILE = config.get("SINK_MOBILE", True)  # Mobile sink by default
     
     if "WIFI_PAYLOAD_BYTES" in config:

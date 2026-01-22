@@ -909,7 +909,7 @@ def generate_all_plots(
 
     if sweep_csvs is None:
         sweep_csvs = {}
-        for param in ["NUM_UAVS", "NUM_SENSORS", "DATA_PAYLOAD_BYTES", "SINK_MOBILE", "AREA_SIZE"]:
+        for param in ["NUM_UAVS", "NUM_SENSORS", "WIFI_PAYLOAD_BYTES", "SINK_MOBILE", "AREA_SIZE"]:
             param_files = [f for f in csv_files if param in f]
             if param_files:
                 sweep_csvs[param] = sorted(param_files)[-1]

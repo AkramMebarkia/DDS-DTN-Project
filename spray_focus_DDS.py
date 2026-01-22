@@ -392,7 +392,7 @@ class SprayMessage:
 # ==========================================
 
 class SprayFocusDDSAgent:
-    MAX_BUFFER = 50
+    MAX_BUFFER = 250
     
     def __init__(self, uid: int, pos: List[float], is_sink: bool = False, 
                  reliable: bool = True, area_size: float = 500):
@@ -634,7 +634,88 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
                         agents[j].encounter_timers[SINK_ID] = t_i_sink + t_meet
         
         # ================================================
-        # 3) SPRAY & FOCUS ROUTING (UAV ↔ UAV)
+        # 3) UAV → SINK DELIVERY (PRIORITIZED - run before relay)
+        # ================================================
+        sink = agents[SINK_ID]
+        
+        for i in range(1, NUM_UAVS):
+            ai = agents[i]
+            if not ai.buffer:
+                continue
+            
+            rate_bps, d, prof = link_rate(ai.pos, sink.pos, is_ground_to_uav=False)
+            
+            if rate_bps < prof.B:
+                continue
+            
+            max_bytes_this_step = (rate_bps * dt) / 8.0
+            bytes_sent = 0
+            msgs_to_remove = []
+            
+            for msg in ai.buffer:
+                if msg.msg_id in sink.delivered_ids:
+                    msgs_to_remove.append(msg)
+                    continue
+                
+                frame_bytes = dds_frame_size(msg.payload_size())
+                if bytes_sent + frame_bytes > max_bytes_this_step:
+                    break
+                
+                # Transmit via DDS
+                bits = frame_bytes * 8
+                tx_e = bits * prof.E_tx_per_bit
+                rx_e = bits * prof.E_rx_per_bit
+                
+                ai.energy -= tx_e
+                ai.radio_tx_energy += tx_e
+                data_wifi_tx_energy += tx_e
+                sink.energy -= rx_e
+                sink.radio_rx_energy += rx_e
+                data_wifi_rx_energy += rx_e
+                
+                # ACKNACK energy for RELIABLE QoS (sink sends ACKNACK)
+                if GLOBAL_QOS == 1:
+                    ack_bytes = dds_acknack_size()
+                    ack_bits = ack_bytes * 8
+                    ack_tx_e = ack_bits * prof.E_tx_per_bit
+                    ack_rx_e = ack_bits * prof.E_rx_per_bit
+                    sink.energy -= ack_tx_e
+                    sink.radio_tx_energy += ack_tx_e
+                    data_wifi_tx_energy += ack_tx_e
+                    ai.energy -= ack_rx_e
+                    ai.radio_rx_energy += ack_rx_e
+                    data_wifi_rx_energy += ack_rx_e
+                
+                data_bytes_sent += frame_bytes
+                bytes_sent += frame_bytes
+                
+                # Mark as delivered
+                sink.delivered_ids.add(msg.msg_id)
+                sink.sink_received_count += 1
+                
+                total_delivered += 1
+                sink_delivery_events += 1
+                hop_counts.append(msg.hop_count)
+                latencies.append(sim_time - msg.creation_time)
+                
+                msgs_to_remove.append(msg)
+            
+            for m in msgs_to_remove:
+                if m in ai.buffer:
+                    ai.buffer.remove(m)
+        
+        # ================================================
+        # 3b) GLOBAL DUPLICATE PURGE
+        # ================================================
+        if total_delivered > 0 and int(sim_time * 10) % 10 == 0:
+            delivered_ids = sink.delivered_ids.copy()
+            for uid, a in agents.items():
+                if uid == SINK_ID or not a.buffer:
+                    continue
+                a.buffer = [m for m in a.buffer if m.msg_id not in delivered_ids]
+        
+        # ================================================
+        # 4) SPRAY & FOCUS ROUTING (UAV ↔ UAV)
         # ================================================
         for i in range(NUM_UAVS):
             if i == SINK_ID:
@@ -716,7 +797,9 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
                         creation_time=msg.creation_time,
                         hop_count=msg.hop_count + 1,
                         tokens=send_tokens,
-                        qos=msg.qos
+                        qos=msg.qos,
+                        payload_bytes=msg.payload_bytes,
+                        
                     )
                     aj.buffer.append(new_msg)
                     aj.seen_msgs.add(msg.msg_id)
@@ -840,7 +923,9 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
                                 creation_time=msg.creation_time,
                                 hop_count=msg.hop_count + 1,
                                 tokens=1,
-                                qos=msg.qos
+                                qos=msg.qos,
+                                payload_bytes=msg.payload_bytes,
+                                
                             )
                             aj.buffer.append(new_msg)
                             aj.seen_msgs.add(msg.msg_id)
@@ -851,87 +936,6 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
                             
                             uav_relay_events += 1
                             focus_events += 1
-        
-        # ================================================
-        # 4) UAV → SINK DELIVERY
-        # ================================================
-        sink = agents[SINK_ID]
-        
-        for i in range(1, NUM_UAVS):
-            ai = agents[i]
-            if not ai.buffer:
-                continue
-            
-            rate_bps, d, prof = link_rate(ai.pos, sink.pos, is_ground_to_uav=False)
-            
-            if rate_bps < prof.B:
-                continue
-            
-            max_bytes_this_step = (rate_bps * dt) / 8.0
-            bytes_sent = 0
-            msgs_to_remove = []
-            
-            for msg in ai.buffer:
-                if msg.msg_id in sink.delivered_ids:
-                    msgs_to_remove.append(msg)
-                    continue
-                
-                frame_bytes = dds_frame_size(msg.payload_size())
-                if bytes_sent + frame_bytes > max_bytes_this_step:
-                    break
-                
-                # Transmit via DDS
-                bits = frame_bytes * 8
-                tx_e = bits * prof.E_tx_per_bit
-                rx_e = bits * prof.E_rx_per_bit
-                
-                ai.energy -= tx_e
-                ai.radio_tx_energy += tx_e
-                data_wifi_tx_energy += tx_e
-                sink.energy -= rx_e
-                sink.radio_rx_energy += rx_e
-                data_wifi_rx_energy += rx_e
-                
-                # ACKNACK energy for RELIABLE QoS (sink sends ACKNACK)
-                if GLOBAL_QOS == 1:
-                    ack_bytes = dds_acknack_size()
-                    ack_bits = ack_bytes * 8
-                    ack_tx_e = ack_bits * prof.E_tx_per_bit
-                    ack_rx_e = ack_bits * prof.E_rx_per_bit
-                    sink.energy -= ack_tx_e
-                    sink.radio_tx_energy += ack_tx_e
-                    data_wifi_tx_energy += ack_tx_e
-                    ai.energy -= ack_rx_e
-                    ai.radio_rx_energy += ack_rx_e
-                    data_wifi_rx_energy += ack_rx_e
-                
-                data_bytes_sent += frame_bytes
-                bytes_sent += frame_bytes
-                
-                # Mark as delivered
-                sink.delivered_ids.add(msg.msg_id)
-                sink.sink_received_count += 1
-                
-                total_delivered += 1
-                sink_delivery_events += 1
-                hop_counts.append(msg.hop_count)
-                latencies.append(sim_time - msg.creation_time)
-                
-                msgs_to_remove.append(msg)
-            
-            for m in msgs_to_remove:
-                if m in ai.buffer:
-                    ai.buffer.remove(m)
-        
-        # ================================================
-        # 4b) GLOBAL DUPLICATE PURGE
-        # ================================================
-        if total_delivered > 0 and int(sim_time * 10) % 10 == 0:
-            delivered_ids = sink.delivered_ids.copy()
-            for uid, a in agents.items():
-                if uid == SINK_ID or not a.buffer:
-                    continue
-                a.buffer = [m for m in a.buffer if m.msg_id not in delivered_ids]
         
         # ================================================
         # 5) SENSOR → UAV UPLOAD

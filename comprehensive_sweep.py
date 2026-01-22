@@ -29,13 +29,13 @@ NUM_RUNS = 10  # Per configuration for 95% CI
 
 # Default baseline configuration
 BASELINE = {
-    "NUM_UAVS": 8,
+    "NUM_UAVS": 6,
     "NUM_SENSORS": 6,
-    "DURATION": 1500.0,
+    "DURATION": 3000.0,
     "INITIAL_TOKENS": 10,
-    "AREA_SIZE": 750,  # Sparser network where S&F multi-hop routing shows advantage
-    "SINK_MOBILE": False,  # Static sink at center - forces multi-hop delivery
-    "WIFI_PAYLOAD_BYTES": 256,  # Only affects WiFi (UAV↔UAV, UAV→Sink)
+    "AREA_SIZE": 1500,  # Sparser network where S&F multi-hop routing shows advantage
+    "SINK_MOBILE": True,  # Static sink at center - forces multi-hop delivery
+    "WIFI_PAYLOAD_BYTES": 128,  # Only affects WiFi (UAV↔UAV, UAV→Sink)
     "GLOBAL_QOS": 1,
     "NUM_SINKS": 1
 }

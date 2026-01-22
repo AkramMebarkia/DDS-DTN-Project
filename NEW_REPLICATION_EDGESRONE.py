@@ -318,7 +318,7 @@ class MqttUAVAgent:
         self.buffer: List[SprayMessage] = []
         self.seen_msgs = set()
         self.encounter_timers: Dict[int, float] = {}
-        self.MAX_BUFFER = 50
+        self.MAX_BUFFER = 250
 
         for i in range(NUM_UAVS):
             self.encounter_timers[i] = 9999.0
@@ -1291,7 +1291,81 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
                 if rate >= WIFI.B:
                     agents[i].encounter_timers[sid] = 0.0
 
-        # 3) SPRAY & FOCUS ROUTING (between mobile UAVs only)
+        # 3) UAV → SINK DELIVERY (PRIORITIZED - run before relay)
+        # Collect all delivered message IDs across all sinks for purging
+        all_delivered_ids = set()
+        for sid in SINK_IDS:
+            all_delivered_ids.update(agents[sid].seen_msgs)
+        
+        for i in range(NUM_UAVS):
+            if i in SINK_IDS:
+                continue
+            ai = agents[i]
+            if not ai.buffer:
+                continue
+            
+            # Try each sink
+            for sid in SINK_IDS:
+                sink = agents[sid]
+                rate_bps, d, prof = link_rate(ai.pos, sink.pos, is_ground_to_uav=False)
+                if rate_bps < prof.B:
+                    continue
+                
+                max_bytes_this_step = (rate_bps * dt) / 8.0
+                bytes_sent = 0
+                msgs_to_remove = []
+
+                for msg in ai.buffer:
+                    # Check if already delivered to ANY sink
+                    if msg.msg_id in all_delivered_ids:
+                        msgs_to_remove.append(msg)
+                        continue
+                    frame_bytes = mqtt_frame_size(msg.payload_size(), msg.qos)
+                    if bytes_sent + frame_bytes > max_bytes_this_step:
+                        break
+                    
+                    success, tx_e, rx_e, _ = MQTTTransmission.transmit_data(rate_bps, prof, msg)
+                    if not success:
+                        continue
+                    
+                    ai.energy -= tx_e
+                    ai.radio_tx_energy += tx_e
+                    data_wifi_tx_energy += tx_e
+                    sink.energy -= rx_e
+                    sink.radio_rx_energy += rx_e
+                    data_wifi_rx_energy += rx_e
+
+                    if msg.qos == 1:
+                        succ_ack, tx_ack, rx_ack, _ = MQTTTransmission.transmit_puback(rate_bps, prof)
+                        if succ_ack:
+                            sink.energy -= tx_ack
+                            sink.radio_tx_energy += tx_ack
+                            data_wifi_tx_energy += tx_ack
+                            ai.energy -= rx_ack
+                            ai.radio_rx_energy += rx_ack
+                            data_wifi_rx_energy += rx_ack
+
+                    sink.seen_msgs.add(msg.msg_id)
+                    all_delivered_ids.add(msg.msg_id)  # Update for other sinks
+                    total_delivered += 1
+                    sink_delivery_events += 1
+                    hop_counts.append(msg.hop_count)
+                    latencies.append(sim_time - msg.creation_time)
+                    bytes_sent += frame_bytes
+                    msgs_to_remove.append(msg)
+
+                for m in msgs_to_remove:
+                    if m in ai.buffer:
+                        ai.buffer.remove(m)
+
+        # 3b) DUPLICATE PURGE (using all sinks' delivered messages)
+        if total_delivered > 0 and int(sim_time * 10) % 10 == 0:
+            for uid, a in agents.items():
+                if uid in SINK_IDS or not a.buffer:
+                    continue
+                a.buffer = [m for m in a.buffer if m.msg_id not in all_delivered_ids]
+
+        # 4) SPRAY & FOCUS ROUTING (between mobile UAVs only)
         for i in range(NUM_UAVS):
             if i in SINK_IDS:
                 continue  # Sink doesn't spray
@@ -1301,7 +1375,7 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
             
             for j in range(NUM_UAVS):
                 if j == i or j in SINK_IDS:
-                    continue  # Don't spray to self or sink (sink handled in Step 4)
+                    continue  # Don't spray to self or sink (sink handled in Step 3)
                 if j == i:
                     continue
                 aj = agents[j]
@@ -1468,80 +1542,6 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
                                 ai.buffer.remove(msg)
                             uav_relay_events += 1
                             focus_events += 1
-
-        # 4) UAV → SINK DELIVERY (to any reachable sink)
-        # Collect all delivered message IDs across all sinks for purging
-        all_delivered_ids = set()
-        for sid in SINK_IDS:
-            all_delivered_ids.update(agents[sid].seen_msgs)
-        
-        for i in range(NUM_UAVS):
-            if i in SINK_IDS:
-                continue
-            ai = agents[i]
-            if not ai.buffer:
-                continue
-            
-            # Try each sink
-            for sid in SINK_IDS:
-                sink = agents[sid]
-                rate_bps, d, prof = link_rate(ai.pos, sink.pos, is_ground_to_uav=False)
-                if rate_bps < prof.B:
-                    continue
-                
-                max_bytes_this_step = (rate_bps * dt) / 8.0
-                bytes_sent = 0
-                msgs_to_remove = []
-
-                for msg in ai.buffer:
-                    # Check if already delivered to ANY sink
-                    if msg.msg_id in all_delivered_ids:
-                        msgs_to_remove.append(msg)
-                        continue
-                    frame_bytes = mqtt_frame_size(msg.payload_size(), msg.qos)
-                    if bytes_sent + frame_bytes > max_bytes_this_step:
-                        break
-                    
-                    success, tx_e, rx_e, _ = MQTTTransmission.transmit_data(rate_bps, prof, msg)
-                    if not success:
-                        continue
-                    
-                    ai.energy -= tx_e
-                    ai.radio_tx_energy += tx_e
-                    data_wifi_tx_energy += tx_e
-                    sink.energy -= rx_e
-                    sink.radio_rx_energy += rx_e
-                    data_wifi_rx_energy += rx_e
-
-                    if msg.qos == 1:
-                        succ_ack, tx_ack, rx_ack, _ = MQTTTransmission.transmit_puback(rate_bps, prof)
-                        if succ_ack:
-                            sink.energy -= tx_ack
-                            sink.radio_tx_energy += tx_ack
-                            data_wifi_tx_energy += tx_ack
-                            ai.energy -= rx_ack
-                            ai.radio_rx_energy += rx_ack
-                            data_wifi_rx_energy += rx_ack
-
-                    sink.seen_msgs.add(msg.msg_id)
-                    all_delivered_ids.add(msg.msg_id)  # Update for other sinks
-                    total_delivered += 1
-                    sink_delivery_events += 1
-                    hop_counts.append(msg.hop_count)
-                    latencies.append(sim_time - msg.creation_time)
-                    bytes_sent += frame_bytes
-                    msgs_to_remove.append(msg)
-
-                for m in msgs_to_remove:
-                    if m in ai.buffer:
-                        ai.buffer.remove(m)
-
-        # 4b) DUPLICATE PURGE (using all sinks' delivered messages)
-        if total_delivered > 0 and int(sim_time * 10) % 10 == 0:
-            for uid, a in agents.items():
-                if uid in SINK_IDS or not a.buffer:
-                    continue
-                a.buffer = [m for m in a.buffer if m.msg_id not in all_delivered_ids]
 
         # 5) SENSOR → UAV UPLOAD
         for s, src_pos in enumerate(iot_nodes):

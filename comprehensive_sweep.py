@@ -29,11 +29,11 @@ NUM_RUNS = 10  # Per configuration for 95% CI
 
 # Default baseline configuration
 BASELINE = {
-    "NUM_UAVS": 6,
-    "NUM_SENSORS": 6,
+    "NUM_UAVS": 9,
+    "NUM_SENSORS": 9,
     "DURATION": 3000.0,
     "INITIAL_TOKENS": 10,
-    "AREA_SIZE": 1500,  # Sparser network where S&F multi-hop routing shows advantage
+    "AREA_SIZE": 2000,  # Sparser network where S&F multi-hop routing shows advantage
     "SINK_MOBILE": True,  # Static sink at center - forces multi-hop delivery
     "WIFI_PAYLOAD_BYTES": 128,  # Only affects WiFi (UAV↔UAV, UAV→Sink)
     "GLOBAL_QOS": 1,
@@ -42,10 +42,10 @@ BASELINE = {
 
 # Parameter variations
 PARAM_SWEEPS = {
-    "NUM_UAVS": [4, 6, 8, 10, 12],
-    "NUM_SENSORS": [4, 6, 8, 10, 12],
-    "WIFI_PAYLOAD_BYTES": [64, 128, 256, 512],  # Only WiFi links (ZigBee sensor payload is fixed at 64)
-    "SINK_MOBILE": [True, False],
+    # "NUM_UAVS": [4, 6, 8, 10, 12],
+    # "NUM_SENSORS": [4, 6, 8, 10, 12],
+    # "WIFI_PAYLOAD_BYTES": [64, 128, 256, 512],  # Only WiFi links (ZigBee sensor payload is fixed at 64)
+    # "SINK_MOBILE": [True, False],
     "AREA_SIZE": [500, 750, 1000, 1500]  # Network density sweep
 }
 

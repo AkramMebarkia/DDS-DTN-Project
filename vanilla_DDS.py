@@ -131,9 +131,11 @@ RTPS_MESSAGE_HEADER = 20      # RTPS Header
 RTPS_DATA_SUBMSG_HEADER = 24  # DATA Submessage header
 
 # --- WiFi (802.11) Transport Layer - for UAV↔UAV and UAV→Sink ---
-WIFI_TCP_IP_OVERHEAD = 40     # IP (20) + UDP (8) + RTP/other (12)
+# DDS/RTPS uses UDP (not TCP) for transport
+WIFI_UDP_HEADER = 8           # UDP header
+WIFI_IP_HEADER = 20           # IP header
 WIFI_L2_OVERHEAD = 30         # WiFi 802.11 MAC/PHY overhead
-WIFI_TRANSPORT_OVERHEAD = WIFI_TCP_IP_OVERHEAD + WIFI_L2_OVERHEAD  # = 70 bytes
+WIFI_TRANSPORT_OVERHEAD = WIFI_UDP_HEADER + WIFI_IP_HEADER + WIFI_L2_OVERHEAD  # = 58 bytes
 
 # --- ZigBee (802.15.4) Transport Layer - for IoT/Sensor→UAV ---
 ZIGBEE_L2_OVERHEAD = 15       # IEEE 802.15.4 MAC overhead
@@ -149,7 +151,7 @@ def dds_frame_size_zigbee(payload_bytes: int) -> int:
 def dds_frame_size_wifi(payload_bytes: int) -> int:
     """DDS/RTPS frame size for WiFi links (UAV↔UAV, UAV→Sink)"""
     return WIFI_TRANSPORT_OVERHEAD + RTPS_MESSAGE_HEADER + RTPS_DATA_SUBMSG_HEADER + payload_bytes
-    # = 70 + 20 + 24 + payload = 114 + payload bytes
+    # = 58 + 20 + 24 + payload = 102 + payload bytes
 
 
 # Legacy alias (for backward compatibility - defaults to WiFi)
@@ -283,7 +285,7 @@ class BufferedMessage:
 
 
 class VanillaDDSAgent:
-    MAX_BUFFER = 50
+    MAX_BUFFER = 250
     
     def __init__(self, uid: int, pos: List[float], is_sink: bool = False, 
                  reliable: bool = True, area_size: float = 500):
@@ -573,7 +575,7 @@ def run_vanilla_dds_simulation(config: dict, verbose: bool = False) -> dict:
             agents[best_uav].energy -= rx_e
             agents[best_uav].radio_rx_energy += rx_e
             
-            # CRITICAL FIX: If sink collects directly, count as instant delivery
+            # If sink collects directly, count as instant delivery
             if best_uav == SINK_ID:
                 sensor_queues[s].pop(0)  # Pop AFTER successful handling
                 if msg_id not in sink.delivered_ids:

@@ -463,7 +463,7 @@ def run_baseline_simulation(config: dict, verbose: bool = False) -> dict:
                 agents[best_uav].radio_tx_energy += puback_bits * prof.E_tx_per_bit
                 sensor_rx_energy += puback_bits * prof.E_rx_per_bit
             
-            # CRITICAL FIX: If sink collects directly, count as instant delivery
+            # If sink collects directly, count as instant delivery
             if best_uav == SINK_ID:
                 sensor_queues[s].pop(0)  # Pop AFTER successful handling
                 if msg_id not in sink.seen_msgs:
@@ -476,12 +476,12 @@ def run_baseline_simulation(config: dict, verbose: bool = False) -> dict:
                 # Regular UAV: put in buffer for later delivery to sink
                 if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
                     sensor_queues[s].pop(0)  # Pop AFTER successful buffer insertion
-                    temp_msg = BaselineMessage(
+                    new_msg = BaselineMessage(
                         msg_id=msg_id, source_id=s, creation_time=t0,
                         hop_count=0, payload=b"SENSOR_DATA", qos=qos_val,
                         payload_bytes=PhyConst.SENSOR_PAYLOAD_BYTES  # 64B for ZigBee sensors
                     )
-                    agents[best_uav].buffer.append(temp_msg)
+                    agents[best_uav].buffer.append(new_msg)
                     agents[best_uav].seen_msgs.add(msg_id)
                 else:
                     # Buffer full - QoS0 drops, QoS1 stays for retry

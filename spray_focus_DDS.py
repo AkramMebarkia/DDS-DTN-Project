@@ -492,6 +492,11 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
     Same physics as MQTT/vanilla but using RTI Connext DDS with DTN.
     """
     global NUM_UAVS, NUM_SENSORS, GLOBAL_QOS, SINK_ID, INITIAL_TOKENS
+    global _SIMULATED_DATA_QUEUE, _SIMULATED_CONTROL_QUEUE
+    
+    # CRITICAL: Reset simulated queues to prevent cross-run contamination
+    _SIMULATED_DATA_QUEUE = []
+    _SIMULATED_CONTROL_QUEUE = []
     
     NUM_UAVS = config.get("NUM_UAVS", 8)
     NUM_SENSORS = config.get("NUM_SENSORS", 6)

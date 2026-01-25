@@ -18,7 +18,7 @@ import numpy as np
 from datetime import datetime
 from typing import Dict, List, Any
 
-sys.path.insert(0, 'c:/Users/akrem/OneDrive - KFUPM/Desktop/Fastdds_Python')
+sys.path.insert(0, 'c:/Users/akrem/OneDrive - KFUPM/Desktop/Fastdds_Python - Copy')
 import zlib  # For stable hash
 
 # ==========================================
@@ -29,24 +29,24 @@ NUM_RUNS = 10  # Per configuration for 95% CI
 
 # Default baseline configuration
 BASELINE = {
-    "NUM_UAVS": 9,
-    "NUM_SENSORS": 9,
-    "DURATION": 3000.0,
-    "INITIAL_TOKENS": 10,
-    "AREA_SIZE": 2000,  # Sparser network where S&F multi-hop routing shows advantage
-    "SINK_MOBILE": True,  # Static sink at center - forces multi-hop delivery
-    "WIFI_PAYLOAD_BYTES": 128,  # Only affects WiFi (UAV↔UAV, UAV→Sink)
+    "NUM_UAVS": 5,
+    "NUM_SENSORS": 10,
+    "DURATION": 1500.0,
+    "INITIAL_TOKENS": 8,
+    "AREA_SIZE": 1000,  # ~25% connectivity - high PDR with S&F advantage
+    "SINK_MOBILE": True,  # Mobile sink participates in routing
+    "WIFI_PAYLOAD_BYTES": 64,  # Only affects WiFi (UAV↔UAV, UAV→Sink)
     "GLOBAL_QOS": 1,
     "NUM_SINKS": 1
 }
 
-# Parameter variations
+# Parameter variationssweep
 PARAM_SWEEPS = {
     # "NUM_UAVS": [4, 6, 8, 10, 12],
     # "NUM_SENSORS": [4, 6, 8, 10, 12],
     # "WIFI_PAYLOAD_BYTES": [64, 128, 256, 512],  # Only WiFi links (ZigBee sensor payload is fixed at 64)
     # "SINK_MOBILE": [True, False],
-    "AREA_SIZE": [500, 750, 1000, 1500]  # Network density sweep
+    "AREA_SIZE": [750, 1000, 1250, 1500, 1750]  # Network density sweep
 }
 
 METRICS = [
@@ -55,6 +55,10 @@ METRICS = [
     "median_latency",
     "energy_per_msg_mJ",
     "avg_hops",
+    "avg_hops_relayed",      # NEW: Only relayed messages (hop_count > 0)
+    "direct_deliveries",     # NEW: IoT → Sink directly
+    "relayed_deliveries",    # NEW: Via UAV relay
+    "direct_delivery_ratio", # NEW: Percentage of direct deliveries
     "total_delivered",
     "spray_events",
     "focus_events",
@@ -79,7 +83,7 @@ def run_mqtt_enhanced(config: dict) -> dict:
     m.GLOBAL_QOS = config.get("GLOBAL_QOS", 1)
     m.NUM_UAVS = config.get("NUM_UAVS", 8)
     m.NUM_SENSORS = config.get("NUM_SENSORS", 6)
-    m.INITIAL_TOKENS = config.get("INITIAL_TOKENS", 10)
+    m.INITIAL_TOKENS = config.get("INITIAL_TOKENS", 1)
 
     # Set WiFi payload size from config (for payload sweep)
     if "WIFI_PAYLOAD_BYTES" in config:
@@ -173,9 +177,9 @@ def run_experiment_set(param_name: str, param_values: list, output_prefix: str):
                 print_progress(run + 1, NUM_RUNS, proto["label"])
                 
                 # CRITICAL: Seed RNG for reproducibility (different seed per run, but deterministic)
-                seed = run * 1000 + zlib.crc32(str(val).encode()) % 10000
-                random.seed(seed)
-                np.random.seed(seed)
+                # seed = run * 1000 + zlib.crc32(str(val).encode()) % 10000
+                # random.seed(seed)
+                # np.random.seed(seed)
                 
                 try:
                     result = proto["runner"](config)

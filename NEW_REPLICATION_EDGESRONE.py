@@ -318,7 +318,7 @@ class MqttUAVAgent:
         self.buffer: List[SprayMessage] = []
         self.seen_msgs = set()
         self.encounter_timers: Dict[int, float] = {}
-        self.MAX_BUFFER = 250
+        self.MAX_BUFFER = 100
 
         for i in range(NUM_UAVS):
             self.encounter_timers[i] = 9999.0
@@ -452,7 +452,7 @@ def run_mqtt_simulation():
     dt = 0.1
 
     # ---- Sensor queues ----
-    SENSOR_RATE = 1.0  # msgs/s per sensor
+    SENSOR_RATE = 5  # msgs/s per sensor
     SENSOR_BUF_MAX = 50
     sensor_queues: List[List[Tuple[int, int, float]]] = [[] for _ in range(NUM_SENSORS)]
     MSG_COUNTER = 0
@@ -1216,7 +1216,7 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
     sim_time = 0.0
 
     # ---- Sensor queues ----
-    SENSOR_RATE = 0.5  # Match sweep baseline (was 1.0)
+    SENSOR_RATE = 5  # Must match all other simulation files (DDS, vanilla, baseline)
     SENSOR_BUF_MAX = 50
     sensor_queues: List[List[Tuple[int, int, float]]] = [[] for _ in range(NUM_SENSORS)]
     MSG_COUNTER = 0
@@ -1233,6 +1233,10 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
     
     latencies = []
     hop_counts = []
+    
+    # Direct vs Relayed delivery tracking
+    direct_deliveries = 0    # IoT → Sink directly (hop_count=0)
+    relayed_deliveries = 0   # Via UAV relay (hop_count≥1)
     
     # Energy tracking
     sensor_tx_energy = 0.0
@@ -1353,6 +1357,11 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
                     latencies.append(sim_time - msg.creation_time)
                     bytes_sent += frame_bytes
                     msgs_to_remove.append(msg)
+                    # Track direct vs relayed
+                    if msg.hop_count > 0:
+                        relayed_deliveries += 1
+                    else:
+                        direct_deliveries += 1
 
                 for m in msgs_to_remove:
                     if m in ai.buffer:
@@ -1594,6 +1603,7 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
                         total_delivered += 1
                         hop_counts.append(0)
                         latencies.append(sim_time - t0)
+                        direct_deliveries += 1  # Direct IoT → Sink
                 else:
                     # Regular UAV: Add to buffer
                     if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
@@ -1612,11 +1622,18 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
     total_data_wifi_energy = data_wifi_tx_energy + data_wifi_rx_energy
     total_data_zigbee = sensor_tx_energy + sensor_rx_energy
 
+    # Compute avg_hops_relayed (only messages with hop_count > 0)
+    relayed_hop_counts = [h for h in hop_counts if h > 0]
+    
     results = {
         "pdr": 100.0 * total_delivered / max(1, total_generated),
         "avg_latency": float(np.mean(latencies)) if latencies else 0.0,
         "median_latency": float(np.median(latencies)) if latencies else 0.0,
         "avg_hops": float(np.mean(hop_counts)) if hop_counts else 0.0,
+        "avg_hops_relayed": float(np.mean(relayed_hop_counts)) if relayed_hop_counts else 0.0,
+        "direct_deliveries": direct_deliveries,
+        "relayed_deliveries": relayed_deliveries,
+        "direct_delivery_ratio": 100.0 * direct_deliveries / max(1, total_delivered),
         "overhead_factor": (uav_relay_events + total_delivered) / max(1, total_delivered),
         "total_generated": total_generated,
         "total_delivered": total_delivered,

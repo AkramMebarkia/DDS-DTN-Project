@@ -44,6 +44,15 @@ NUM_SENSORS = 6
 INITIAL_TOKENS = 10
 
 # ==========================================
+# DDS BATCH QOS POLICY (per RTI Connext DDS)
+# ==========================================
+# Reference: RTI Connext DDS User Manual Section 7.4.1
+BATCH_ENABLE = True           # Enable batching for sink delivery
+BATCH_MAX_SAMPLES = 5         # batch.max_samples - max messages per batch
+BATCH_MAX_DATA_BYTES = 1024   # batch.max_data_bytes - max payload bytes before flush
+BATCH_FLUSH_DELAY = 0.1       # batch.max_flush_delay - max wait (seconds) before send
+
+# ==========================================
 # DDS/RTPS PROTOCOL OVERHEAD (per OMG RTPS Spec)
 # ==========================================
 
@@ -225,6 +234,29 @@ def dds_acknack_size() -> int:
     return dds_acknack_size_wifi()
 
 
+def dds_batched_frame_size_wifi(payload_bytes_list: list) -> int:
+    """
+    DDS/RTPS batched frame size for WiFi links.
+    Multiple DATA submessages share one RTPS message header.
+    
+    Per OMG RTPS 2.3 Spec Section 8.3.7.5:
+    A single RTPS message can contain multiple DATA submessages.
+    
+    Args:
+        payload_bytes_list: List of payload sizes in the batch
+    
+    Returns:
+        Total frame size in bytes
+    """
+    num_samples = len(payload_bytes_list)
+    total_payload = sum(payload_bytes_list)
+    
+    # One transport header + one RTPS header for the batch
+    # Each sample adds one DATA submessage header + payload
+    return (WIFI_TRANSPORT_OVERHEAD + RTPS_MESSAGE_HEADER + 
+            num_samples * RTPS_DATA_SUBMSG_HEADER + total_payload)
+
+
 # ==========================================
 # 4) DDS MESSAGE TYPES
 # ==========================================
@@ -392,7 +424,7 @@ class SprayMessage:
 # ==========================================
 
 class SprayFocusDDSAgent:
-    MAX_BUFFER = 250
+    MAX_BUFFER = 100
     
     def __init__(self, uid: int, pos: List[float], is_sink: bool = False, 
                  reliable: bool = True, area_size: float = 500):
@@ -567,7 +599,7 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
     iot_nodes = generate_spread_sensors(NUM_SENSORS, AREA_SIZE, seed=42)
     
     sim_time = 0.0
-    SENSOR_RATE = 0.5
+    SENSOR_RATE = 5
     SENSOR_BUF_MAX = 50
     sensor_queues: List[List[Tuple[int, int, float]]] = [[] for _ in range(NUM_SENSORS)]
     MSG_COUNTER = 0
@@ -582,6 +614,10 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
     control_messages_sent = 0
     latencies = []
     hop_counts = []
+    
+    # Direct vs Relayed delivery tracking
+    direct_deliveries = 0    # IoT → Sink directly (hop_count=0)
+    relayed_deliveries = 0   # Via UAV relay (hop_count≥1)
     
     # Energy tracking
     sensor_tx_energy = 0.0
@@ -639,8 +675,12 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
                         agents[j].encounter_timers[SINK_ID] = t_i_sink + t_meet
         
         # ================================================
-        # 3) UAV → SINK DELIVERY (PRIORITIZED - run before relay)
+        # 3) UAV → SINK DELIVERY WITH BATCH QOS (PRIORITIZED)
         # ================================================
+        # DDS Batch QoS Policy: Multiple samples share one RTPS header
+        # - batch.max_samples: Max messages per batch
+        # - batch.max_data_bytes: Max payload bytes per batch
+        # - Entire batch acknowledged with single ACKNACK
         sink = agents[SINK_ID]
         
         for i in range(1, NUM_UAVS):
@@ -657,54 +697,148 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
             bytes_sent = 0
             msgs_to_remove = []
             
-            for msg in ai.buffer:
-                if msg.msg_id in sink.delivered_ids:
-                    msgs_to_remove.append(msg)
-                    continue
-                
-                frame_bytes = dds_frame_size(msg.payload_size())
-                if bytes_sent + frame_bytes > max_bytes_this_step:
-                    break
-                
-                # Transmit via DDS
-                bits = frame_bytes * 8
-                tx_e = bits * prof.E_tx_per_bit
-                rx_e = bits * prof.E_rx_per_bit
-                
-                ai.energy -= tx_e
-                ai.radio_tx_energy += tx_e
-                data_wifi_tx_energy += tx_e
-                sink.energy -= rx_e
-                sink.radio_rx_energy += rx_e
-                data_wifi_rx_energy += rx_e
-                
-                # ACKNACK energy for RELIABLE QoS (sink sends ACKNACK)
-                if GLOBAL_QOS == 1:
-                    ack_bytes = dds_acknack_size()
-                    ack_bits = ack_bytes * 8
-                    ack_tx_e = ack_bits * prof.E_tx_per_bit
-                    ack_rx_e = ack_bits * prof.E_rx_per_bit
-                    sink.energy -= ack_tx_e
-                    sink.radio_tx_energy += ack_tx_e
-                    data_wifi_tx_energy += ack_tx_e
-                    ai.energy -= ack_rx_e
-                    ai.radio_rx_energy += ack_rx_e
-                    data_wifi_rx_energy += ack_rx_e
-                
-                data_bytes_sent += frame_bytes
-                bytes_sent += frame_bytes
-                
-                # Mark as delivered
-                sink.delivered_ids.add(msg.msg_id)
-                sink.sink_received_count += 1
-                
-                total_delivered += 1
-                sink_delivery_events += 1
-                hop_counts.append(msg.hop_count)
-                latencies.append(sim_time - msg.creation_time)
-                
-                msgs_to_remove.append(msg)
+            # Filter deliverable messages (not already delivered)
+            deliverable = [m for m in ai.buffer if m.msg_id not in sink.delivered_ids]
             
+            # Already delivered - mark for removal
+            for m in ai.buffer:
+                if m.msg_id in sink.delivered_ids:
+                    msgs_to_remove.append(m)
+            
+            if BATCH_ENABLE and len(deliverable) > 1:
+                # ========================================
+                # BATCHED DELIVERY (DDS Batch QoS)
+                # ========================================
+                msg_idx = 0
+                
+                while msg_idx < len(deliverable):
+                    # Build batch respecting limits
+                    batch = []
+                    batch_payload_bytes = 0
+                    
+                    while msg_idx < len(deliverable):
+                        msg = deliverable[msg_idx]
+                        msg_payload = msg.payload_size()
+                        
+                        # Check batch limits (sample count)
+                        if len(batch) >= BATCH_MAX_SAMPLES:
+                            break
+                        
+                        # Check batch limits (byte count)
+                        if batch_payload_bytes + msg_payload > BATCH_MAX_DATA_BYTES and len(batch) > 0:
+                            break
+                        
+                        batch.append(msg)
+                        batch_payload_bytes += msg_payload
+                        msg_idx += 1
+                    
+                    if not batch:
+                        break
+                    
+                    # Calculate batched frame size (shared RTPS header)
+                    payload_sizes = [m.payload_size() for m in batch]
+                    frame_bytes = dds_batched_frame_size_wifi(payload_sizes)
+                    
+                    # Check bandwidth capacity
+                    if bytes_sent + frame_bytes > max_bytes_this_step:
+                        break
+                    
+                    # Transmit batched frame via DDS
+                    bits = frame_bytes * 8
+                    tx_e = bits * prof.E_tx_per_bit
+                    rx_e = bits * prof.E_rx_per_bit
+                    
+                    ai.energy -= tx_e
+                    ai.radio_tx_energy += tx_e
+                    data_wifi_tx_energy += tx_e
+                    sink.energy -= rx_e
+                    sink.radio_rx_energy += rx_e
+                    data_wifi_rx_energy += rx_e
+                    
+                    # Single ACKNACK for entire batch (RELIABLE QoS)
+                    # Per OMG RTPS Spec: batch is acknowledged as a unit
+                    if GLOBAL_QOS == 1:
+                        ack_bytes = dds_acknack_size()
+                        ack_bits = ack_bytes * 8
+                        ack_tx_e = ack_bits * prof.E_tx_per_bit
+                        ack_rx_e = ack_bits * prof.E_rx_per_bit
+                        sink.energy -= ack_tx_e
+                        sink.radio_tx_energy += ack_tx_e
+                        data_wifi_tx_energy += ack_tx_e
+                        ai.energy -= ack_rx_e
+                        ai.radio_rx_energy += ack_rx_e
+                        data_wifi_rx_energy += ack_rx_e
+                    
+                    data_bytes_sent += frame_bytes
+                    bytes_sent += frame_bytes
+                    
+                    # Mark all messages in batch as delivered
+                    for msg in batch:
+                        sink.delivered_ids.add(msg.msg_id)
+                        sink.sink_received_count += 1
+                        total_delivered += 1
+                        sink_delivery_events += 1
+                        hop_counts.append(msg.hop_count)
+                        latencies.append(sim_time - msg.creation_time)
+                        msgs_to_remove.append(msg)
+                        # Track direct vs relayed
+                        if msg.hop_count > 0:
+                            relayed_deliveries += 1
+                        else:
+                            direct_deliveries += 1
+            
+            else:
+                # ========================================
+                # UNBATCHED DELIVERY (single message or disabled)
+                # ========================================
+                for msg in deliverable:
+                    frame_bytes = dds_frame_size(msg.payload_size())
+                    if bytes_sent + frame_bytes > max_bytes_this_step:
+                        break
+                    
+                    # Transmit via DDS
+                    bits = frame_bytes * 8
+                    tx_e = bits * prof.E_tx_per_bit
+                    rx_e = bits * prof.E_rx_per_bit
+                    
+                    ai.energy -= tx_e
+                    ai.radio_tx_energy += tx_e
+                    data_wifi_tx_energy += tx_e
+                    sink.energy -= rx_e
+                    sink.radio_rx_energy += rx_e
+                    data_wifi_rx_energy += rx_e
+                    
+                    # ACKNACK energy for RELIABLE QoS
+                    if GLOBAL_QOS == 1:
+                        ack_bytes = dds_acknack_size()
+                        ack_bits = ack_bytes * 8
+                        ack_tx_e = ack_bits * prof.E_tx_per_bit
+                        ack_rx_e = ack_bits * prof.E_rx_per_bit
+                        sink.energy -= ack_tx_e
+                        sink.radio_tx_energy += ack_tx_e
+                        data_wifi_tx_energy += ack_tx_e
+                        ai.energy -= ack_rx_e
+                        ai.radio_rx_energy += ack_rx_e
+                        data_wifi_rx_energy += ack_rx_e
+                    
+                    data_bytes_sent += frame_bytes
+                    bytes_sent += frame_bytes
+                    
+                    # Mark as delivered
+                    sink.delivered_ids.add(msg.msg_id)
+                    sink.sink_received_count += 1
+                    total_delivered += 1
+                    sink_delivery_events += 1
+                    hop_counts.append(msg.hop_count)
+                    latencies.append(sim_time - msg.creation_time)
+                    msgs_to_remove.append(msg)
+                    # Track direct vs relayed
+                    if msg.hop_count > 0:
+                        relayed_deliveries += 1
+                    else:
+                        direct_deliveries += 1
+            
+            # Remove delivered messages from buffer
             for m in msgs_to_remove:
                 if m in ai.buffer:
                     ai.buffer.remove(m)
@@ -984,6 +1118,7 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
                     sink_delivery_events += 1
                     hop_counts.append(0)  # Direct collection = 0 hops
                     latencies.append(sim_time - t0)
+                    direct_deliveries += 1  # Direct IoT → Sink
             else:
                 # Regular UAV: put in buffer for S&F routing
                 if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
@@ -1013,11 +1148,18 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
     else:
         overhead_factor = 1.0
     
+    # Compute avg_hops_relayed (only messages with hop_count > 0)
+    relayed_hop_counts = [h for h in hop_counts if h > 0]
+    
     results = {
         "pdr": 100.0 * total_delivered / max(1, total_generated),
         "avg_latency": float(np.mean(latencies)) if latencies else 0.0,
         "median_latency": float(np.median(latencies)) if latencies else 0.0,
         "avg_hops": float(np.mean(hop_counts)) if hop_counts else 0.0,
+        "avg_hops_relayed": float(np.mean(relayed_hop_counts)) if relayed_hop_counts else 0.0,
+        "direct_deliveries": direct_deliveries,
+        "relayed_deliveries": relayed_deliveries,
+        "direct_delivery_ratio": 100.0 * direct_deliveries / max(1, total_delivered),
         "overhead_factor": overhead_factor,
         "total_generated": total_generated,
         "total_delivered": total_delivered,

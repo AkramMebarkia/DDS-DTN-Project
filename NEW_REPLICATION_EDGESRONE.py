@@ -318,7 +318,7 @@ class MqttUAVAgent:
         self.buffer: List[SprayMessage] = []
         self.seen_msgs = set()
         self.encounter_timers: Dict[int, float] = {}
-        self.MAX_BUFFER = 100
+        self.MAX_BUFFER = 250
 
         for i in range(NUM_UAVS):
             self.encounter_timers[i] = 9999.0
@@ -452,7 +452,7 @@ def run_mqtt_simulation():
     dt = 0.1
 
     # ---- Sensor queues ----
-    SENSOR_RATE = 5  # msgs/s per sensor
+    SENSOR_RATE = 2.0  # msgs/s per sensor
     SENSOR_BUF_MAX = 50
     sensor_queues: List[List[Tuple[int, int, float]]] = [[] for _ in range(NUM_SENSORS)]
     MSG_COUNTER = 0
@@ -953,6 +953,7 @@ def run_mqtt_simulation():
                             latencies_qos1.append(lat)
                 else:
                     # Regular UAV: put in buffer for S&F routing
+                    # SMART BUFFER POLICY: Prioritize own sensor data over relayed replicas
                     if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
                         sensor_queues[s].pop(0)  # Pop AFTER successful buffer insertion
                         temp_msg = SprayMessage(
@@ -968,9 +969,34 @@ def run_mqtt_simulation():
                         agents[best_uav].buffer.append(temp_msg)
                         agents[best_uav].seen_msgs.add(msg_id)
                     else:
-                        # Buffer full - QoS0 drops, QoS1 stays for retry
-                        if qos_val == 0:
-                            sensor_queues[s].pop(0)
+                        # Buffer full - Try to evict a relayed replica (hop_count > 0)
+                        evicted = False
+                        for victim_idx, victim_msg in enumerate(agents[best_uav].buffer):
+                            if victim_msg.hop_count > 0:
+                                # Evict this replica to make space for own data
+                                agents[best_uav].buffer.pop(victim_idx)
+                                evicted = True
+                                
+                                # Insert new sensor message
+                                sensor_queues[s].pop(0)
+                                temp_msg = SprayMessage(
+                                    msg_id=msg_id,
+                                    source_id=s,
+                                    creation_time=t0,
+                                    hop_count=0,
+                                    tokens=INITIAL_TOKENS,
+                                    payload=b"SENSOR_DATA",
+                                    qos=qos_val,
+                                    payload_bytes=PhyConst.SENSOR_PAYLOAD_BYTES
+                                )
+                                agents[best_uav].buffer.append(temp_msg)
+                                agents[best_uav].seen_msgs.add(msg_id)
+                                break
+                        
+                        if not evicted:
+                            # Buffer full of own data - QoS0 drops, QoS1 stays for retry
+                            if qos_val == 0:
+                                sensor_queues[s].pop(0)
 
     except KeyboardInterrupt:
         print("\n\nSimulation interrupted by user.")
@@ -1162,6 +1188,10 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
     # Area size
     AREA_SIZE = config.get("AREA_SIZE", 750)  # Default to 750m (matching sweep baseline)
     
+    # Apply buffer size if present
+    if "MAX_BUFFER" in config:
+        MqttUAVAgent.MAX_BUFFER = config["MAX_BUFFER"]
+    
     # Apply payload size
     if "WIFI_PAYLOAD_BYTES" in config:
         PhyConst.WIFI_DATA_PAYLOAD_BYTES = config["WIFI_PAYLOAD_BYTES"]
@@ -1216,7 +1246,7 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
     sim_time = 0.0
 
     # ---- Sensor queues ----
-    SENSOR_RATE = 5  # Must match all other simulation files (DDS, vanilla, baseline)
+    SENSOR_RATE = 2.0  # Must match all other simulation files (DDS, vanilla, baseline)
     SENSOR_BUF_MAX = 50
     sensor_queues: List[List[Tuple[int, int, float]]] = [[] for _ in range(NUM_SENSORS)]
     MSG_COUNTER = 0

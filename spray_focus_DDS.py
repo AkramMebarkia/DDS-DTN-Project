@@ -50,7 +50,7 @@ INITIAL_TOKENS = 10
 BATCH_ENABLE = True           # Enable batching for sink delivery
 BATCH_MAX_SAMPLES = 5         # batch.max_samples - max messages per batch
 BATCH_MAX_DATA_BYTES = 1024   # batch.max_data_bytes - max payload bytes before flush
-BATCH_FLUSH_DELAY = 0.1       # batch.max_flush_delay - max wait (seconds) before send
+BATCH_FLUSH_DELAY = 0.05       # batch.max_flush_delay - max wait (seconds) before send
 
 # ==========================================
 # DDS/RTPS PROTOCOL OVERHEAD (per OMG RTPS Spec)
@@ -424,7 +424,7 @@ class SprayMessage:
 # ==========================================
 
 class SprayFocusDDSAgent:
-    MAX_BUFFER = 100
+    MAX_BUFFER = 250
     
     def __init__(self, uid: int, pos: List[float], is_sink: bool = False, 
                  reliable: bool = True, area_size: float = 500):
@@ -547,6 +547,15 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
     duration = config.get("DURATION", 1500.0)
     dt = 0.1
     
+    # Apply buffer size if present
+    if "MAX_BUFFER" in config:
+        SprayFocusDDSAgent.MAX_BUFFER = config["MAX_BUFFER"]
+        
+    # Apply batching config if present (override global default)
+    global BATCH_ENABLE
+    if "BATCH_ENABLE" in config:
+        BATCH_ENABLE = config["BATCH_ENABLE"]
+    
     # Initialize UAVs
     agents: Dict[int, SprayFocusDDSAgent] = {}
     
@@ -599,7 +608,7 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
     iot_nodes = generate_spread_sensors(NUM_SENSORS, AREA_SIZE, seed=42)
     
     sim_time = 0.0
-    SENSOR_RATE = 5
+    SENSOR_RATE = 2.0
     SENSOR_BUF_MAX = 50
     sensor_queues: List[List[Tuple[int, int, float]]] = [[] for _ in range(NUM_SENSORS)]
     MSG_COUNTER = 0
@@ -1121,6 +1130,7 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
                     direct_deliveries += 1  # Direct IoT → Sink
             else:
                 # Regular UAV: put in buffer for S&F routing
+                # SMART BUFFER POLICY: Prioritize own sensor data over relayed replicas
                 if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
                     sensor_queues[s].pop(0)  # Pop AFTER successful buffer insertion
                     new_msg = SprayMessage(
@@ -1131,9 +1141,29 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
                     agents[best_uav].buffer.append(new_msg)
                     agents[best_uav].seen_msgs.add(msg_id)
                 else:
-                    # Buffer full - BE drops, Reliable stays for retry
-                    if qos_val == 0:
-                        sensor_queues[s].pop(0)
+                    # Buffer full - Try to evict a relayed replica (hop_count > 0)
+                    evicted = False
+                    for victim_idx, victim_msg in enumerate(agents[best_uav].buffer):
+                        if victim_msg.hop_count > 0:
+                            # Evict this replica to make space for own data
+                            agents[best_uav].buffer.pop(victim_idx)
+                            evicted = True
+                            
+                            # Insert new sensor message
+                            sensor_queues[s].pop(0)
+                            new_msg = SprayMessage(
+                                msg_id=msg_id, source_id=s, creation_time=t0,
+                                hop_count=0, tokens=INITIAL_TOKENS, qos=qos_val,
+                                payload_bytes=PhyConst.SENSOR_PAYLOAD_BYTES
+                            )
+                            agents[best_uav].buffer.append(new_msg)
+                            agents[best_uav].seen_msgs.add(msg_id)
+                            break
+                    
+                    if not evicted:
+                        # Buffer full of own data - BE drops, Reliable stays for retry
+                        if qos_val == 0:
+                            sensor_queues[s].pop(0)
     
     # Compute results
     total_uav_tx = sum(a.radio_tx_energy for a in agents.values())

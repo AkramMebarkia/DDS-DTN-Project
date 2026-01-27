@@ -285,7 +285,7 @@ class BufferedMessage:
 
 
 class VanillaDDSAgent:
-    MAX_BUFFER = 100
+    MAX_BUFFER = 250
     
     def __init__(self, uid: int, pos: List[float], is_sink: bool = False, 
                  reliable: bool = True, area_size: float = 500):
@@ -395,6 +395,10 @@ def run_vanilla_dds_simulation(config: dict, verbose: bool = False) -> dict:
     duration = config.get("DURATION", 1500.0)
     dt = 0.1
     
+    # Apply buffer size if present
+    if "MAX_BUFFER" in config:
+        VanillaDDSAgent.MAX_BUFFER = config["MAX_BUFFER"]
+    
     # Initialize UAVs
     agents: Dict[int, VanillaDDSAgent] = {}
     
@@ -446,7 +450,7 @@ def run_vanilla_dds_simulation(config: dict, verbose: bool = False) -> dict:
     iot_nodes = generate_spread_sensors(NUM_SENSORS, AREA_SIZE, seed=42)
     
     sim_time = 0.0
-    SENSOR_RATE = 5
+    SENSOR_RATE = 2.0
     SENSOR_BUF_MAX = 50
     sensor_queues: List[List[Tuple[int, int, float]]] = [[] for _ in range(NUM_SENSORS)]
     MSG_COUNTER = 0

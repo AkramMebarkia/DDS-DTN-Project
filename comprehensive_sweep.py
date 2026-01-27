@@ -29,23 +29,25 @@ NUM_RUNS = 10  # Per configuration for 95% CI
 
 # Default baseline configuration
 BASELINE = {
-    "NUM_UAVS": 5,
+    "NUM_UAVS": 6,
     "NUM_SENSORS": 10,
     "DURATION": 1500.0,
-    "INITIAL_TOKENS": 8,
-    "AREA_SIZE": 1000,  # ~25% connectivity - high PDR with S&F advantage
+    "INITIAL_TOKENS": 6,
+    "AREA_SIZE": 750,  # ~25% connectivity - high PDR with S&F advantage
     "SINK_MOBILE": True,  # Mobile sink participates in routing
     "WIFI_PAYLOAD_BYTES": 64,  # Only affects WiFi (UAV↔UAV, UAV→Sink)
     "GLOBAL_QOS": 1,
-    "NUM_SINKS": 1
+    "NUM_SINKS": 1,
+    "MAX_BUFFER": 250,  # Small buffer to test congestion handling
+    "BATCH_ENABLE": True  # Disable DDS batching for fair comparison
 }
 
 # Parameter variationssweep
 PARAM_SWEEPS = {
-    # "NUM_UAVS": [4, 6, 8, 10, 12],
-    # "NUM_SENSORS": [4, 6, 8, 10, 12],
-    # "WIFI_PAYLOAD_BYTES": [64, 128, 256, 512],  # Only WiFi links (ZigBee sensor payload is fixed at 64)
-    # "SINK_MOBILE": [True, False],
+    "NUM_UAVS": [4, 6, 8, 10, 12],
+    "NUM_SENSORS": [4, 6, 8, 10, 12],
+    "WIFI_PAYLOAD_BYTES": [64, 128, 256, 512],  # Only WiFi links (ZigBee sensor payload is fixed at 64)
+    "SINK_MOBILE": [True, False],
     "AREA_SIZE": [750, 1000, 1250, 1500, 1750]  # Network density sweep
 }
 

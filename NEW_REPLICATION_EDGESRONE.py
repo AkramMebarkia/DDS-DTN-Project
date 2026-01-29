@@ -12,12 +12,16 @@ from typing import List, Dict, Tuple, Optional
 GLOBAL_QOS = 1          # 0 = fire-and-forget, 1 = at-least-once with retry
 
 # Spray & Focus initial token budget per new DTN message
-INITIAL_TOKENS = 10
+INITIAL_TOKENS = 8
+# Message Time-To-Live (seconds)
 
 # Topology sizes
-NUM_UAVS = 8           # UAVs 0..99
+NUM_UAVS = 6           # UAVs 0..99
 SINK_ID = 0              # UAV 0 is the sink/base station
-NUM_SENSORS = 6         # Ground IoT nodes
+NUM_SENSORS = 10         # Ground IoT nodes
+
+# Sink mobility: moves within 30% of area_size around center (saves energy, UAVs come to it)
+SINK_MOBILITY_FRACTION = 0.40
 
 # MQTT overhead approximations (bytes)
 MQTT_TOPIC_LEN = 16      # e.g. "edge/data/NN"
@@ -336,9 +340,19 @@ class MqttUAVAgent:
 
         # Random waypoint mobility (using configurable area size)
         if not self.waypoints:
-            self.waypoints = [np.array([random.uniform(100, self.area_size-100), 
-                                        random.uniform(100, self.area_size-100), 
-                                        PhyConst.H]) for _ in range(5)]
+            if self.id == SINK_ID:
+                # Sink: Limited mobility within 30% radius around center (saves energy)
+                center = self.area_size / 2
+                radius = self.area_size * SINK_MOBILITY_FRACTION / 2
+                self.waypoints = [np.array([
+                    center + random.uniform(-radius, radius),
+                    center + random.uniform(-radius, radius),
+                    PhyConst.H]) for _ in range(5)]
+            else:
+                # Regular UAVs: Full area coverage for sensor collection
+                self.waypoints = [np.array([random.uniform(100, self.area_size-100), 
+                                            random.uniform(100, self.area_size-100), 
+                                            PhyConst.H]) for _ in range(5)]
 
         speed = 20.0  # m/s
         target = self.waypoints[0]
@@ -452,7 +466,7 @@ def run_mqtt_simulation():
     dt = 0.1
 
     # ---- Sensor queues ----
-    SENSOR_RATE = 2.0  # msgs/s per sensor
+    SENSOR_RATE = 3.0  # msgs/s per sensor
     SENSOR_BUF_MAX = 50
     sensor_queues: List[List[Tuple[int, int, float]]] = [[] for _ in range(NUM_SENSORS)]
     MSG_COUNTER = 0
@@ -889,9 +903,9 @@ def run_mqtt_simulation():
                 if not sensor_queues[s]:
                     continue
                 
-                # Find nearest UAV (including sink)
+                # Find nearest UAV (EXCLUDING sink - sink only receives from UAVs, not sensors)
                 best_uav = min(
-                    range(NUM_UAVS),
+                    [k for k in range(NUM_UAVS) if k != SINK_ID],
                     key=lambda k: np.linalg.norm(agents[k].pos - src_pos)
                 )
                 
@@ -934,69 +948,51 @@ def run_mqtt_simulation():
                     agents[best_uav].radio_tx_energy += puback_bits * prof.E_tx_per_bit
                     sensor_rx_energy += puback_bits * prof.E_rx_per_bit
                 
-                # CRITICAL FIX: If sink collects directly, count as instant delivery
-                if best_uav == SINK_ID:
-                    sensor_queues[s].pop(0)  # Pop AFTER successful handling
-                    if msg_id not in sink.seen_msgs:
-                        sink.seen_msgs.add(msg_id)
-                        sink.sink_received_count += 1
-                        total_delivered += 1
-                        sink_delivery_events += 1
-                        hop_counts.append(0)  # Direct collection = 0 hops
-                        lat = sim_time - t0
-                        latencies.append(lat)
-                        if qos_val == 0:
-                            total_delivered_qos0 += 1
-                            latencies_qos0.append(lat)
-                        else:
-                            total_delivered_qos1 += 1
-                            latencies_qos1.append(lat)
+                # UAV buffers sensor data for S&F routing to sink
+                # SMART BUFFER POLICY: Prioritize own sensor data over relayed replicas
+                if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
+                    sensor_queues[s].pop(0)  # Pop AFTER successful buffer insertion
+                    temp_msg = SprayMessage(
+                        msg_id=msg_id,
+                        source_id=s,
+                        creation_time=t0,
+                        hop_count=0,
+                        tokens=INITIAL_TOKENS,
+                        payload=b"SENSOR_DATA",
+                        qos=qos_val,
+                        payload_bytes=PhyConst.SENSOR_PAYLOAD_BYTES  # 64B for ZigBee sensors
+                    )
+                    agents[best_uav].buffer.append(temp_msg)
+                    agents[best_uav].seen_msgs.add(msg_id)
                 else:
-                    # Regular UAV: put in buffer for S&F routing
-                    # SMART BUFFER POLICY: Prioritize own sensor data over relayed replicas
-                    if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
-                        sensor_queues[s].pop(0)  # Pop AFTER successful buffer insertion
-                        temp_msg = SprayMessage(
-                            msg_id=msg_id,
-                            source_id=s,
-                            creation_time=t0,
-                            hop_count=0,
-                            tokens=INITIAL_TOKENS,
-                            payload=b"SENSOR_DATA",
-                            qos=qos_val,
-                            payload_bytes=PhyConst.SENSOR_PAYLOAD_BYTES  # 64B for ZigBee sensors
-                        )
-                        agents[best_uav].buffer.append(temp_msg)
-                        agents[best_uav].seen_msgs.add(msg_id)
-                    else:
-                        # Buffer full - Try to evict a relayed replica (hop_count > 0)
-                        evicted = False
-                        for victim_idx, victim_msg in enumerate(agents[best_uav].buffer):
-                            if victim_msg.hop_count > 0:
-                                # Evict this replica to make space for own data
-                                agents[best_uav].buffer.pop(victim_idx)
-                                evicted = True
-                                
-                                # Insert new sensor message
-                                sensor_queues[s].pop(0)
-                                temp_msg = SprayMessage(
-                                    msg_id=msg_id,
-                                    source_id=s,
-                                    creation_time=t0,
-                                    hop_count=0,
-                                    tokens=INITIAL_TOKENS,
-                                    payload=b"SENSOR_DATA",
-                                    qos=qos_val,
-                                    payload_bytes=PhyConst.SENSOR_PAYLOAD_BYTES
-                                )
-                                agents[best_uav].buffer.append(temp_msg)
-                                agents[best_uav].seen_msgs.add(msg_id)
-                                break
-                        
-                        if not evicted:
-                            # Buffer full of own data - QoS0 drops, QoS1 stays for retry
-                            if qos_val == 0:
-                                sensor_queues[s].pop(0)
+                    # Buffer full - Try to evict a relayed replica (hop_count > 0)
+                    evicted = False
+                    for victim_idx, victim_msg in enumerate(agents[best_uav].buffer):
+                        if victim_msg.hop_count > 0:
+                            # Evict this replica to make space for own data
+                            agents[best_uav].buffer.pop(victim_idx)
+                            evicted = True
+                            
+                            # Insert new sensor message
+                            sensor_queues[s].pop(0)
+                            temp_msg = SprayMessage(
+                                msg_id=msg_id,
+                                source_id=s,
+                                creation_time=t0,
+                                hop_count=0,
+                                tokens=INITIAL_TOKENS,
+                                payload=b"SENSOR_DATA",
+                                qos=qos_val,
+                                payload_bytes=PhyConst.SENSOR_PAYLOAD_BYTES
+                            )
+                            agents[best_uav].buffer.append(temp_msg)
+                            agents[best_uav].seen_msgs.add(msg_id)
+                            break
+                    
+                    if not evicted:
+                        # Buffer full of own data - QoS0 drops, QoS1 stays for retry
+                        if qos_val == 0:
+                            sensor_queues[s].pop(0)
 
     except KeyboardInterrupt:
         print("\n\nSimulation interrupted by user.")
@@ -1246,7 +1242,7 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
     sim_time = 0.0
 
     # ---- Sensor queues ----
-    SENSOR_RATE = 2.0  # Must match all other simulation files (DDS, vanilla, baseline)
+    SENSOR_RATE = 3.0  # Must match all other simulation files (DDS, vanilla, baseline)
     SENSOR_BUF_MAX = 50
     sensor_queues: List[List[Tuple[int, int, float]]] = [[] for _ in range(NUM_SENSORS)]
     MSG_COUNTER = 0
@@ -1325,86 +1321,11 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
                 if rate >= WIFI.B:
                     agents[i].encounter_timers[sid] = 0.0
 
-        # 3) UAV → SINK DELIVERY (PRIORITIZED - run before relay)
-        # Collect all delivered message IDs across all sinks for purging
-        all_delivered_ids = set()
-        for sid in SINK_IDS:
-            all_delivered_ids.update(agents[sid].seen_msgs)
-        
-        for i in range(NUM_UAVS):
-            if i in SINK_IDS:
-                continue
-            ai = agents[i]
-            if not ai.buffer:
-                continue
-            
-            # Try each sink
-            for sid in SINK_IDS:
-                sink = agents[sid]
-                rate_bps, d, prof = link_rate(ai.pos, sink.pos, is_ground_to_uav=False)
-                if rate_bps < prof.B:
-                    continue
-                
-                max_bytes_this_step = (rate_bps * dt) / 8.0
-                bytes_sent = 0
-                msgs_to_remove = []
 
-                for msg in ai.buffer:
-                    # Check if already delivered to ANY sink
-                    if msg.msg_id in all_delivered_ids:
-                        msgs_to_remove.append(msg)
-                        continue
-                    frame_bytes = mqtt_frame_size(msg.payload_size(), msg.qos)
-                    if bytes_sent + frame_bytes > max_bytes_this_step:
-                        break
-                    
-                    success, tx_e, rx_e, _ = MQTTTransmission.transmit_data(rate_bps, prof, msg)
-                    if not success:
-                        continue
-                    
-                    ai.energy -= tx_e
-                    ai.radio_tx_energy += tx_e
-                    data_wifi_tx_energy += tx_e
-                    sink.energy -= rx_e
-                    sink.radio_rx_energy += rx_e
-                    data_wifi_rx_energy += rx_e
 
-                    if msg.qos == 1:
-                        succ_ack, tx_ack, rx_ack, _ = MQTTTransmission.transmit_puback(rate_bps, prof)
-                        if succ_ack:
-                            sink.energy -= tx_ack
-                            sink.radio_tx_energy += tx_ack
-                            data_wifi_tx_energy += tx_ack
-                            ai.energy -= rx_ack
-                            ai.radio_rx_energy += rx_ack
-                            data_wifi_rx_energy += rx_ack
 
-                    sink.seen_msgs.add(msg.msg_id)
-                    all_delivered_ids.add(msg.msg_id)  # Update for other sinks
-                    total_delivered += 1
-                    sink_delivery_events += 1
-                    hop_counts.append(msg.hop_count)
-                    latencies.append(sim_time - msg.creation_time)
-                    bytes_sent += frame_bytes
-                    msgs_to_remove.append(msg)
-                    # Track direct vs relayed
-                    if msg.hop_count > 0:
-                        relayed_deliveries += 1
-                    else:
-                        direct_deliveries += 1
 
-                for m in msgs_to_remove:
-                    if m in ai.buffer:
-                        ai.buffer.remove(m)
-
-        # 3b) DUPLICATE PURGE (using all sinks' delivered messages)
-        if total_delivered > 0 and int(sim_time * 10) % 10 == 0:
-            for uid, a in agents.items():
-                if uid in SINK_IDS or not a.buffer:
-                    continue
-                a.buffer = [m for m in a.buffer if m.msg_id not in all_delivered_ids]
-
-        # 4) SPRAY & FOCUS ROUTING (between mobile UAVs only)
+        # 3) SPRAY & FOCUS ROUTING (between mobile UAVs only - run BEFORE sink delivery)
         for i in range(NUM_UAVS):
             if i in SINK_IDS:
                 continue  # Sink doesn't spray
@@ -1414,7 +1335,7 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
             
             for j in range(NUM_UAVS):
                 if j == i or j in SINK_IDS:
-                    continue  # Don't spray to self or sink (sink handled in Step 3)
+                    continue  # Don't spray to self or sink (sink handled in Step 4)
                 if j == i:
                     continue
                 aj = agents[j]
@@ -1582,11 +1503,92 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
                             uav_relay_events += 1
                             focus_events += 1
 
-        # 5) SENSOR → UAV UPLOAD
+        # 4) UAV → SINK DELIVERY (run AFTER S&F routing)
+        # Collect all delivered message IDs across all sinks for purging
+        all_delivered_ids = set()
+        for sid in SINK_IDS:
+            all_delivered_ids.update(agents[sid].seen_msgs)
+        
+        for i in range(NUM_UAVS):
+            if i in SINK_IDS:
+                continue
+            ai = agents[i]
+            if not ai.buffer:
+                continue
+            
+            # Try each sink
+            for sid in SINK_IDS:
+                sink = agents[sid]
+                rate_bps, d, prof = link_rate(ai.pos, sink.pos, is_ground_to_uav=False)
+                if rate_bps < prof.B:
+                    continue
+                
+                max_bytes_this_step = (rate_bps * dt) / 8.0
+                bytes_sent = 0
+                msgs_to_remove = []
+
+                for msg in ai.buffer:
+                    # Check if already delivered to ANY sink
+                    if msg.msg_id in all_delivered_ids:
+                        msgs_to_remove.append(msg)
+                        continue
+                    frame_bytes = mqtt_frame_size(msg.payload_size(), msg.qos)
+                    if bytes_sent + frame_bytes > max_bytes_this_step:
+                        break
+                    
+                    success, tx_e, rx_e, _ = MQTTTransmission.transmit_data(rate_bps, prof, msg)
+                    if not success:
+                        continue
+                    
+                    ai.energy -= tx_e
+                    ai.radio_tx_energy += tx_e
+                    data_wifi_tx_energy += tx_e
+                    sink.energy -= rx_e
+                    sink.radio_rx_energy += rx_e
+                    data_wifi_rx_energy += rx_e
+
+                    if msg.qos == 1:
+                        succ_ack, tx_ack, rx_ack, _ = MQTTTransmission.transmit_puback(rate_bps, prof)
+                        if succ_ack:
+                            sink.energy -= tx_ack
+                            sink.radio_tx_energy += tx_ack
+                            data_wifi_tx_energy += tx_ack
+                            ai.energy -= rx_ack
+                            ai.radio_rx_energy += rx_ack
+                            data_wifi_rx_energy += rx_ack
+
+                    sink.seen_msgs.add(msg.msg_id)
+                    all_delivered_ids.add(msg.msg_id)  # Update for other sinks
+                    total_delivered += 1
+                    sink_delivery_events += 1
+                    hop_counts.append(msg.hop_count)
+                    latencies.append(sim_time - msg.creation_time)
+                    bytes_sent += frame_bytes
+                    msgs_to_remove.append(msg)
+                    # Track direct vs relayed
+                    if msg.hop_count > 0:
+                        relayed_deliveries += 1
+                    else:
+                        direct_deliveries += 1
+
+                for m in msgs_to_remove:
+                    if m in ai.buffer:
+                        ai.buffer.remove(m)
+
+        # 4b) DUPLICATE PURGE (using all sinks' delivered messages)
+        if total_delivered > 0 and int(sim_time * 10) % 10 == 0:
+            for uid, a in agents.items():
+                if uid in SINK_IDS or not a.buffer:
+                    continue
+                a.buffer = [m for m in a.buffer if m.msg_id not in all_delivered_ids]
+
+        # 5) SENSOR → UAV UPLOAD (EXCLUDING SINK - sink only receives from UAVs)
         for s, src_pos in enumerate(iot_nodes):
             if not sensor_queues[s]:
                 continue
-            best_uav = min(range(NUM_UAVS), key=lambda k: np.linalg.norm(agents[k].pos - src_pos))
+            # Exclude sink from sensor collection
+            best_uav = min([k for k in range(NUM_UAVS) if k not in SINK_IDS], 
+                          key=lambda k: np.linalg.norm(agents[k].pos - src_pos))
             rate, d, prof = link_rate(src_pos, agents[best_uav].pos, is_ground_to_uav=True)
             
             if rate < prof.B:
@@ -1625,20 +1627,10 @@ def run_simulation(config: dict, verbose: bool = False) -> dict:
 
                 sensor_queues[s].pop(0)
                 
-                # Direct Sink Delivery Check
-                if best_uav in SINK_IDS:
-                    if msg_id not in agents[best_uav].seen_msgs:
-                        agents[best_uav].seen_msgs.add(msg_id)
-                        all_delivered_ids.add(msg_id)
-                        total_delivered += 1
-                        hop_counts.append(0)
-                        latencies.append(sim_time - t0)
-                        direct_deliveries += 1  # Direct IoT → Sink
-                else:
-                    # Regular UAV: Add to buffer
-                    if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
-                        agents[best_uav].buffer.append(temp_msg)
-                        agents[best_uav].seen_msgs.add(msg_id)
+                # UAV buffers sensor data for S&F routing to sink
+                if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
+                    agents[best_uav].buffer.append(temp_msg)
+                    agents[best_uav].seen_msgs.add(msg_id)
             else:
                 if qos_val == 0:
                     sensor_queues[s].pop(0)

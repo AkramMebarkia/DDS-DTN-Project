@@ -23,9 +23,13 @@ from typing import List, Dict, Tuple, Optional
 
 GLOBAL_QOS = 1
 INITIAL_TOKENS = 0  # Not used in baseline, kept for compatibility
-NUM_UAVS = 8
+# Message Time-To-Live (seconds)
+NUM_UAVS = 6
 SINK_ID = 0
-NUM_SENSORS = 6
+NUM_SENSORS = 10
+
+# Sink mobility: moves within 30% of area_size around center (saves energy, UAVs come to it)
+SINK_MOBILITY_FRACTION = 0.40
 
 MQTT_TOPIC_LEN = 16
 TCP_IP_OVERHEAD = 40
@@ -220,14 +224,21 @@ class BaselineUAVAgent:
         self._waypoint_timer = 0.0
 
     def move(self, dt: float):
-        if self.is_sink:
-            return
-        
-        # Random waypoint mobility (matching spray_focus_DDS.py)
+        # Random waypoint mobility (sink has limited range, UAVs have full area)
         if not hasattr(self, 'waypoints') or not self.waypoints:
-            self.waypoints = [np.array([random.uniform(100, self.area_size-100), 
-                                        random.uniform(100, self.area_size-100), 
-                                        PhyConst.H]) for _ in range(5)]
+            if self.id == SINK_ID:
+                # Sink: Limited mobility within 30% radius around center (saves energy)
+                center = self.area_size / 2
+                radius = self.area_size * SINK_MOBILITY_FRACTION / 2
+                self.waypoints = [np.array([
+                    center + random.uniform(-radius, radius),
+                    center + random.uniform(-radius, radius),
+                    PhyConst.H]) for _ in range(5)]
+            else:
+                # Regular UAVs: Full area coverage for sensor collection
+                self.waypoints = [np.array([random.uniform(100, self.area_size-100), 
+                                            random.uniform(100, self.area_size-100), 
+                                            PhyConst.H]) for _ in range(5)]
         
         speed = 20.0  # Fixed 20 m/s (matching S&F simulations)
         target = self.waypoints[0]
@@ -334,7 +345,7 @@ def run_baseline_simulation(config: dict, verbose: bool = False) -> dict:
     iot_nodes = generate_spread_sensors(NUM_SENSORS, AREA_SIZE, seed=42)
 
     sim_time = 0.0
-    SENSOR_RATE = 2.0
+    SENSOR_RATE = 3.0
     SENSOR_BUF_MAX = 50
     sensor_queues: List[List[Tuple[int, int, float]]] = [[] for _ in range(NUM_SENSORS)]
     MSG_COUNTER = 0
@@ -426,13 +437,18 @@ def run_baseline_simulation(config: dict, verbose: bool = False) -> dict:
                 if m in ai.buffer:
                     ai.buffer.remove(m)
 
+
+
+
+
         # 3) SENSOR → UAV UPLOAD
         for s, src_pos in enumerate(iot_nodes):
             if not sensor_queues[s]:
                 continue
             
-            # Include sink in collection - find nearest UAV (including sink)
-            best_uav = min(range(NUM_UAVS), key=lambda k: np.linalg.norm(agents[k].pos - src_pos))
+            # Exclude sink from sensor collection - sink only receives from UAVs
+            best_uav = min([k for k in range(NUM_UAVS) if k != SINK_ID], 
+                          key=lambda k: np.linalg.norm(agents[k].pos - src_pos))
             rate, d, prof = link_rate(src_pos, agents[best_uav].pos, is_ground_to_uav=True)
             
             if rate < prof.B:
@@ -467,30 +483,20 @@ def run_baseline_simulation(config: dict, verbose: bool = False) -> dict:
                 agents[best_uav].radio_tx_energy += puback_bits * prof.E_tx_per_bit
                 sensor_rx_energy += puback_bits * prof.E_rx_per_bit
             
-            # If sink collects directly, count as instant delivery
-            if best_uav == SINK_ID:
-                sensor_queues[s].pop(0)  # Pop AFTER successful handling
-                if msg_id not in sink.seen_msgs:
-                    sink.seen_msgs.add(msg_id)
-                    total_delivered += 1
-                    sink_delivery_events += 1
-                    hop_counts.append(0)  # Direct collection = 0 hops
-                    latencies.append(sim_time - t0)
+            # UAV buffers sensor data for later delivery to sink
+            if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
+                sensor_queues[s].pop(0)  # Pop AFTER successful buffer insertion
+                new_msg = BaselineMessage(
+                    msg_id=msg_id, source_id=s, creation_time=t0,
+                    hop_count=0, payload=b"SENSOR_DATA", qos=qos_val,
+                    payload_bytes=PhyConst.SENSOR_PAYLOAD_BYTES  # 64B for ZigBee sensors
+                )
+                agents[best_uav].buffer.append(new_msg)
+                agents[best_uav].seen_msgs.add(msg_id)
             else:
-                # Regular UAV: put in buffer for later delivery to sink
-                if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
-                    sensor_queues[s].pop(0)  # Pop AFTER successful buffer insertion
-                    new_msg = BaselineMessage(
-                        msg_id=msg_id, source_id=s, creation_time=t0,
-                        hop_count=0, payload=b"SENSOR_DATA", qos=qos_val,
-                        payload_bytes=PhyConst.SENSOR_PAYLOAD_BYTES  # 64B for ZigBee sensors
-                    )
-                    agents[best_uav].buffer.append(new_msg)
-                    agents[best_uav].seen_msgs.add(msg_id)
-                else:
-                    # Buffer full - QoS0 drops, QoS1 stays for retry
-                    if qos_val == 0:
-                        sensor_queues[s].pop(0)
+                # Buffer full - QoS0 drops, QoS1 stays for retry
+                if qos_val == 0:
+                    sensor_queues[s].pop(0)
 
     # Compute results
     total_uav_tx = sum(a.radio_tx_energy for a in agents.values())

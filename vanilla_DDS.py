@@ -36,13 +36,17 @@ except ImportError:
 # ==========================================
 
 GLOBAL_QOS = 1  # 0 = Best Effort, 1 = Reliable
-NUM_UAVS = 8
+NUM_UAVS = 6
 SINK_ID = 0
-NUM_SENSORS = 6
+NUM_SENSORS = 10
+
+# Sink mobility: moves within 30% of area_size around center (saves energy, UAVs come to it)
+SINK_MOBILITY_FRACTION = 0.40
 
 # DDS-specific overhead
 RTPS_HEADER_BYTES = 64  # RTPS protocol overhead
 DDS_BATCH_SIZE = 5  # RTI Connext batches ~5 messages per MTU
+# Message Time-To-Live (seconds)
 
 # ==========================================
 # 2) PHYSICS / RADIO PROFILES (MATCHED TO MQTT)
@@ -237,7 +241,7 @@ class RTIDDSInterface:
             wqos.reliability.kind = dds.ReliabilityKind.BEST_EFFORT
         wqos.durability.kind = dds.DurabilityKind.VOLATILE
         wqos.history.kind = dds.HistoryKind.KEEP_LAST
-        wqos.history.depth = 100
+        wqos.history.depth = 3000
         
         self.writer = dds.DataWriter(self.publisher, self.topic, wqos)
         
@@ -249,7 +253,7 @@ class RTIDDSInterface:
             rqos.reliability.kind = dds.ReliabilityKind.BEST_EFFORT
         rqos.durability.kind = dds.DurabilityKind.VOLATILE
         rqos.history.kind = dds.HistoryKind.KEEP_LAST
-        rqos.history.depth = 100
+        rqos.history.depth = 3000
         
         self.reader = dds.DataReader(self.subscriber, self.topic, rqos)
 
@@ -313,14 +317,21 @@ class VanillaDDSAgent:
         self._waypoint_timer = 0.0
     
     def move(self, dt: float):
-        if self.is_sink:
-            return
-        
-        # Random waypoint mobility (matching spray_focus_DDS.py)
+        # Random waypoint mobility (sink has limited range, UAVs have full area)
         if not hasattr(self, 'waypoints') or not self.waypoints:
-            self.waypoints = [np.array([random.uniform(100, self.area_size-100), 
-                                        random.uniform(100, self.area_size-100), 
-                                        PhyConst.H]) for _ in range(5)]
+            if self.id == SINK_ID:
+                # Sink: Limited mobility within 30% radius around center (saves energy)
+                center = self.area_size / 2
+                radius = self.area_size * SINK_MOBILITY_FRACTION / 2
+                self.waypoints = [np.array([
+                    center + random.uniform(-radius, radius),
+                    center + random.uniform(-radius, radius),
+                    PhyConst.H]) for _ in range(5)]
+            else:
+                # Regular UAVs: Full area coverage for sensor collection
+                self.waypoints = [np.array([random.uniform(100, self.area_size-100), 
+                                            random.uniform(100, self.area_size-100), 
+                                            PhyConst.H]) for _ in range(5)]
         
         speed = 20.0  # Fixed 20 m/s (matching S&F simulations)
         target = self.waypoints[0]
@@ -450,7 +461,7 @@ def run_vanilla_dds_simulation(config: dict, verbose: bool = False) -> dict:
     iot_nodes = generate_spread_sensors(NUM_SENSORS, AREA_SIZE, seed=42)
     
     sim_time = 0.0
-    SENSOR_RATE = 2.0
+    SENSOR_RATE = 3.0
     SENSOR_BUF_MAX = 50
     sensor_queues: List[List[Tuple[int, int, float]]] = [[] for _ in range(NUM_SENSORS)]
     MSG_COUNTER = 0
@@ -532,6 +543,10 @@ def run_vanilla_dds_simulation(config: dict, verbose: bool = False) -> dict:
             for m in msgs_to_remove:
                 if m in ai.buffer:
                     ai.buffer.remove(m)
+
+
+
+
         
         # 3) SINK READS DDS MESSAGES
         try:
@@ -549,12 +564,13 @@ def run_vanilla_dds_simulation(config: dict, verbose: bool = False) -> dict:
         except Exception:
             pass
         
-        # 4) SENSOR → UAV UPLOAD (ZigBee)
+        # 4) SENSOR → UAV UPLOAD (ZigBee) - EXCLUDING SINK
         for s, src_pos in enumerate(iot_nodes):
             if not sensor_queues[s]:
                 continue
             
-            best_uav = min(range(NUM_UAVS), 
+            # Exclude sink from sensor collection - sink only receives from UAVs
+            best_uav = min([k for k in range(NUM_UAVS) if k != SINK_ID], 
                           key=lambda k: np.linalg.norm(agents[k].pos - src_pos))
             rate, d, prof = link_rate(src_pos, agents[best_uav].pos, is_ground_to_uav=True)
             
@@ -579,29 +595,19 @@ def run_vanilla_dds_simulation(config: dict, verbose: bool = False) -> dict:
             agents[best_uav].energy -= rx_e
             agents[best_uav].radio_rx_energy += rx_e
             
-            # If sink collects directly, count as instant delivery
-            if best_uav == SINK_ID:
-                sensor_queues[s].pop(0)  # Pop AFTER successful handling
-                if msg_id not in sink.delivered_ids:
-                    sink.delivered_ids.add(msg_id)
-                    total_delivered += 1
-                    sink_delivery_events += 1
-                    hop_counts.append(0)  # Direct collection = 0 hops
-                    latencies.append(sim_time - t0)
+            # UAV buffers sensor data for later delivery to sink
+            if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
+                sensor_queues[s].pop(0)  # Pop AFTER successful buffer insertion
+                new_msg = BufferedMessage(
+                    msg_id=msg_id, source_id=s, creation_time=t0,
+                    hop_count=0, qos=qos_val
+                )
+                agents[best_uav].buffer.append(new_msg)
+                agents[best_uav].seen_msgs.add(msg_id)
             else:
-                # Regular UAV: put in buffer for later delivery to sink
-                if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
-                    sensor_queues[s].pop(0)  # Pop AFTER successful buffer insertion
-                    new_msg = BufferedMessage(
-                        msg_id=msg_id, source_id=s, creation_time=t0,
-                        hop_count=0, qos=qos_val
-                    )
-                    agents[best_uav].buffer.append(new_msg)
-                    agents[best_uav].seen_msgs.add(msg_id)
-                else:
-                    # Buffer full - BE drops, Reliable stays for retry
-                    if qos_val == 0:
-                        sensor_queues[s].pop(0)
+                # Buffer full - BE drops, Reliable stays for retry
+                if qos_val == 0:
+                    sensor_queues[s].pop(0)
     
     # Compute results
     total_uav_tx = sum(a.radio_tx_energy for a in agents.values())

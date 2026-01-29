@@ -36,12 +36,16 @@ except ImportError:
 # ==========================================
 
 GLOBAL_QOS = 1  # 0 = Best Effort, 1 = Reliable
-NUM_UAVS = 8
+NUM_UAVS = 6
 SINK_ID = 0
-NUM_SENSORS = 6
+NUM_SENSORS = 10
 
 # Spray & Focus initial token budget
-INITIAL_TOKENS = 10
+INITIAL_TOKENS = 8
+# Message Time-To-Live (seconds)
+
+# Sink mobility: moves within 30% of area_size around center (saves energy, UAVs come to it)
+SINK_MOBILITY_FRACTION = 0.40
 
 # ==========================================
 # DDS BATCH QOS POLICY (per RTI Connext DDS)
@@ -461,19 +465,26 @@ class SprayFocusDDSAgent:
     
     def move(self, dt: float):
         """Update position and encounter timers"""
-        if self.is_sink:
-            return
-        
         # Age encounter timers
         for k in self.encounter_timers.keys():
             self.encounter_timers[k] += dt
         self.encounter_timers[self.id] = 0.0
         
-        # Random waypoint mobility
+        # Random waypoint mobility (sink has limited range, UAVs have full area)
         if not self.waypoints:
-            self.waypoints = [np.array([random.uniform(100, self.area_size-100), 
-                                        random.uniform(100, self.area_size-100), 
-                                        PhyConst.H]) for _ in range(5)]
+            if self.id == SINK_ID:
+                # Sink: Limited mobility within 30% radius around center (saves energy)
+                center = self.area_size / 2
+                radius = self.area_size * SINK_MOBILITY_FRACTION / 2
+                self.waypoints = [np.array([
+                    center + random.uniform(-radius, radius),
+                    center + random.uniform(-radius, radius),
+                    PhyConst.H]) for _ in range(5)]
+            else:
+                # Regular UAVs: Full area coverage for sensor collection
+                self.waypoints = [np.array([random.uniform(100, self.area_size-100), 
+                                            random.uniform(100, self.area_size-100), 
+                                            PhyConst.H]) for _ in range(5)]
         
         speed = 20.0  # m/s
         target = self.waypoints[0]
@@ -608,7 +619,7 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
     iot_nodes = generate_spread_sensors(NUM_SENSORS, AREA_SIZE, seed=42)
     
     sim_time = 0.0
-    SENSOR_RATE = 2.0
+    SENSOR_RATE = 3.0
     SENSOR_BUF_MAX = 50
     sensor_queues: List[List[Tuple[int, int, float]]] = [[] for _ in range(NUM_SENSORS)]
     MSG_COUNTER = 0
@@ -860,7 +871,10 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
             for uid, a in agents.items():
                 if uid == SINK_ID or not a.buffer:
                     continue
+                if uid == SINK_ID or not a.buffer:
+                    continue
                 a.buffer = [m for m in a.buffer if m.msg_id not in delivered_ids]
+
         
         # ================================================
         # 4) SPRAY & FOCUS ROUTING (UAV ↔ UAV)
@@ -1086,13 +1100,14 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
                             focus_events += 1
         
         # ================================================
-        # 5) SENSOR → UAV UPLOAD
+        # 5) SENSOR → UAV UPLOAD (EXCLUDING SINK)
         # ================================================
         for s, src_pos in enumerate(iot_nodes):
             if not sensor_queues[s]:
                 continue
             
-            best_uav = min(range(NUM_UAVS), 
+            # Exclude sink from sensor collection - sink only receives from UAVs
+            best_uav = min([k for k in range(NUM_UAVS) if k != SINK_ID], 
                           key=lambda k: np.linalg.norm(agents[k].pos - src_pos))
             rate, d, prof = link_rate(src_pos, agents[best_uav].pos, is_ground_to_uav=True)
             
@@ -1117,53 +1132,41 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
             agents[best_uav].energy -= rx_e
             agents[best_uav].radio_rx_energy += rx_e
             
-            # CRITICAL FIX: If sink collects directly, count as instant delivery (like vanilla DDS)
-            if best_uav == SINK_ID:
-                sensor_queues[s].pop(0)  # Pop AFTER successful handling
-                if msg_id not in agents[SINK_ID].delivered_ids:
-                    agents[SINK_ID].delivered_ids.add(msg_id)
-                    agents[SINK_ID].sink_received_count += 1
-                    total_delivered += 1
-                    sink_delivery_events += 1
-                    hop_counts.append(0)  # Direct collection = 0 hops
-                    latencies.append(sim_time - t0)
-                    direct_deliveries += 1  # Direct IoT → Sink
+            # UAV buffers sensor data for S&F routing to sink
+            # SMART BUFFER POLICY: Prioritize own sensor data over relayed replicas
+            if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
+                sensor_queues[s].pop(0)  # Pop AFTER successful buffer insertion
+                new_msg = SprayMessage(
+                    msg_id=msg_id, source_id=s, creation_time=t0,
+                    hop_count=0, tokens=INITIAL_TOKENS, qos=qos_val,
+                    payload_bytes=PhyConst.SENSOR_PAYLOAD_BYTES
+                )
+                agents[best_uav].buffer.append(new_msg)
+                agents[best_uav].seen_msgs.add(msg_id)
             else:
-                # Regular UAV: put in buffer for S&F routing
-                # SMART BUFFER POLICY: Prioritize own sensor data over relayed replicas
-                if len(agents[best_uav].buffer) < agents[best_uav].MAX_BUFFER:
-                    sensor_queues[s].pop(0)  # Pop AFTER successful buffer insertion
-                    new_msg = SprayMessage(
-                        msg_id=msg_id, source_id=s, creation_time=t0,
-                        hop_count=0, tokens=INITIAL_TOKENS, qos=qos_val,
-                        payload_bytes=PhyConst.SENSOR_PAYLOAD_BYTES
-                    )
-                    agents[best_uav].buffer.append(new_msg)
-                    agents[best_uav].seen_msgs.add(msg_id)
-                else:
-                    # Buffer full - Try to evict a relayed replica (hop_count > 0)
-                    evicted = False
-                    for victim_idx, victim_msg in enumerate(agents[best_uav].buffer):
-                        if victim_msg.hop_count > 0:
-                            # Evict this replica to make space for own data
-                            agents[best_uav].buffer.pop(victim_idx)
-                            evicted = True
-                            
-                            # Insert new sensor message
-                            sensor_queues[s].pop(0)
-                            new_msg = SprayMessage(
-                                msg_id=msg_id, source_id=s, creation_time=t0,
-                                hop_count=0, tokens=INITIAL_TOKENS, qos=qos_val,
-                                payload_bytes=PhyConst.SENSOR_PAYLOAD_BYTES
-                            )
-                            agents[best_uav].buffer.append(new_msg)
-                            agents[best_uav].seen_msgs.add(msg_id)
-                            break
-                    
-                    if not evicted:
-                        # Buffer full of own data - BE drops, Reliable stays for retry
-                        if qos_val == 0:
-                            sensor_queues[s].pop(0)
+                # Buffer full - Try to evict a relayed replica (hop_count > 0)
+                evicted = False
+                for victim_idx, victim_msg in enumerate(agents[best_uav].buffer):
+                    if victim_msg.hop_count > 0:
+                        # Evict this replica to make space for own data
+                        agents[best_uav].buffer.pop(victim_idx)
+                        evicted = True
+                        
+                        # Insert new sensor message
+                        sensor_queues[s].pop(0)
+                        new_msg = SprayMessage(
+                            msg_id=msg_id, source_id=s, creation_time=t0,
+                            hop_count=0, tokens=INITIAL_TOKENS, qos=qos_val,
+                            payload_bytes=PhyConst.SENSOR_PAYLOAD_BYTES
+                        )
+                        agents[best_uav].buffer.append(new_msg)
+                        agents[best_uav].seen_msgs.add(msg_id)
+                        break
+                
+                if not evicted:
+                    # Buffer full of own data - BE drops, Reliable stays for retry
+                    if qos_val == 0:
+                        sensor_queues[s].pop(0)
     
     # Compute results
     total_uav_tx = sum(a.radio_tx_energy for a in agents.values())

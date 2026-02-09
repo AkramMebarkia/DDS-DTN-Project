@@ -39,16 +39,17 @@ BASELINE = {
     "GLOBAL_QOS": 1,
     "NUM_SINKS": 1,
     "MAX_BUFFER": 200,     # Reduced to 250 as per user request
-    "BATCH_ENABLE": True   # Disable DDS batching for fair comparison
+    "BATCH_ENABLE": False   # Disable DDS batching for fair comparison
 }
 
 # Parameter variationssweep
 PARAM_SWEEPS = {
-    # "NUM_UAVS": [4, 6, 8, 10, 12],
-    "NUM_SENSORS": [4, 6, 8, 10, 12],
-    # "WIFI_PAYLOAD_BYTES": [64, 128, 256, 512],  # Only WiFi links (ZigBee sensor payload is fixed at 64)
+    "NUM_UAVS": [4, 6, 8, 10, 12],
+    "NUM_SENSORS": [4, 8, 16, 32, 64],
+    "WIFI_PAYLOAD_BYTES": [64, 128, 256, 512],  # Only WiFi links (ZigBee sensor payload is fixed at 64)
     # "SINK_MOBILE": [True, False],
-    # "AREA_SIZE": [500, 750, 1000, 1250, 1500]  # Network density sweep
+    
+    "AREA_SIZE": [500, 750, 1000, 1250, 1500]  # Network density sweep
 }
 
 METRICS = [
@@ -64,7 +65,10 @@ METRICS = [
     "total_delivered",
     "spray_events",
     "focus_events",
-    "overhead_factor"
+    "overhead_factor",
+    # Flight energy metrics (for mobile vs static sink tradeoff)
+    "sink_flight_energy_kJ",    # Sink propulsion energy (0 if static)
+    "total_system_energy_kJ"    # Total system energy (flight + radio)
 ]
 
 

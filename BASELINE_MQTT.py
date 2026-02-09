@@ -94,10 +94,17 @@ def calibrate_beta0(prof: PHYProfile, target_snr_dB: float = 0.0, ref_dist: floa
     prof.beta0 = prof.N0 * (REF_DIST**2) / prof.P_tx
 
 def shannon_rate_3d(dist_3d: float, profile: PHYProfile) -> float:
+    """Shannon rate (bps) with 1/r^2 pathloss, capped at PHY rate limit"""
     if dist_3d <= 0.0:
         dist_3d = 1e-3
     snr = (profile.beta0 * profile.P_tx) / (profile.N0 * (dist_3d**2))
-    return profile.B * math.log2(1.0 + snr)
+    rate = profile.B * math.log2(1.0 + snr)
+    # Apply PHY rate cap: ZigBee = 250 kbps, WiFi = 54 Mbps
+    if profile.name == "zigbee":
+        rate = min(rate, 250_000.0)  # IEEE 802.15.4 PHY limit
+    elif profile.name == "wifi":
+        rate = min(rate, 54_000_000.0)  # IEEE 802.11g PHY limit
+    return rate
 
 def link_rate(pos1, pos2, is_ground_to_uav: bool):
     d = float(np.linalg.norm(np.array(pos1) - np.array(pos2)))
@@ -314,6 +321,9 @@ def run_baseline_simulation(config: dict, verbose: bool = False) -> dict:
     for i in range(1, NUM_UAVS):
         agents[i] = BaselineUAVAgent(i, [random.uniform(100, AREA_SIZE-100), random.uniform(100, AREA_SIZE-100), PhyConst.H], area_size=AREA_SIZE)
 
+    # Store initial energy for flight energy calculation
+    initial_energy = {uid: agent.energy for uid, agent in agents.items()}
+
     # Initialize sensors with well-spaced random positions (reproducible)
     def generate_spread_sensors(num_sensors, area_size, seed=42):
         """Generate well-spaced sensor positions using seeded random with minimum distance."""
@@ -345,7 +355,7 @@ def run_baseline_simulation(config: dict, verbose: bool = False) -> dict:
     iot_nodes = generate_spread_sensors(NUM_SENSORS, AREA_SIZE, seed=42)
 
     sim_time = 0.0
-    SENSOR_RATE = 3.0
+    SENSOR_RATE = 2.0
     SENSOR_BUF_MAX = 50
     sensor_queues: List[List[Tuple[int, int, float]]] = [[] for _ in range(NUM_SENSORS)]
     MSG_COUNTER = 0
@@ -521,7 +531,10 @@ def run_baseline_simulation(config: dict, verbose: bool = False) -> dict:
         "data_wifi_energy": total_data_wifi_energy,
         "data_zigbee_energy": total_data_zigbee,
         "total_uav_radio_energy": total_uav_radio,
-        "energy_per_msg_mJ": (total_uav_radio / max(1, total_delivered)) * 1000
+        "energy_per_msg_mJ": (total_uav_radio / max(1, total_delivered)) * 1000,
+        # Flight energy metrics (for mobile vs static sink tradeoff)
+        "sink_flight_energy_kJ": (initial_energy[SINK_ID] - agents[SINK_ID].energy - agents[SINK_ID].radio_tx_energy - agents[SINK_ID].radio_rx_energy) / 1000.0,
+        "total_system_energy_kJ": sum(initial_energy[uid] - agents[uid].energy for uid in agents) / 1000.0,
     }
     
     if verbose:

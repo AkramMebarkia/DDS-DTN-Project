@@ -54,7 +54,7 @@ SINK_MOBILITY_FRACTION = 0.40
 BATCH_ENABLE = True           # Enable batching for sink delivery
 BATCH_MAX_SAMPLES = 5         # batch.max_samples - max messages per batch
 BATCH_MAX_DATA_BYTES = 1024   # batch.max_data_bytes - max payload bytes before flush
-BATCH_FLUSH_DELAY = 0.05       # batch.max_flush_delay - max wait (seconds) before send
+BATCH_FLUSH_DELAY = 0.1       # batch.max_flush_delay - max wait (seconds) before send
 
 # ==========================================
 # DDS/RTPS PROTOCOL OVERHEAD (per OMG RTPS Spec)
@@ -172,11 +172,17 @@ for _p in (ZIGBEE, WIFI):
 
 
 def shannon_rate_3d(dist_3d: float, profile: PHYProfile) -> float:
-    """Shannon rate (bps) with 1/r² pathloss"""
+    """Shannon rate (bps) with 1/r² pathloss, capped at PHY rate limit"""
     if dist_3d <= 0.0:
         dist_3d = 1e-3
     snr = (profile.beta0 * profile.P_tx) / (profile.N0 * (dist_3d**2))
-    return profile.B * math.log2(1.0 + snr)
+    rate = profile.B * math.log2(1.0 + snr)
+    # Apply PHY rate cap: ZigBee = 250 kbps, WiFi = 54 Mbps
+    if profile.name == "zigbee":
+        rate = min(rate, 250_000.0)  # IEEE 802.15.4 PHY limit
+    elif profile.name == "wifi":
+        rate = min(rate, 54_000_000.0)  # IEEE 802.11g PHY limit
+    return rate
 
 
 def link_rate(pos1, pos2, is_ground_to_uav: bool) -> Tuple[float, float, PHYProfile]:
@@ -588,6 +594,9 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
                                             random.uniform(100, AREA_SIZE-100), PhyConst.H],
                                         reliable=RELIABLE, area_size=AREA_SIZE)
     
+    # Store initial energy for flight energy calculation
+    initial_energy = {uid: agent.energy for uid, agent in agents.items()}
+    
     # Initialize sensors with well-spaced random positions (reproducible)
     def generate_spread_sensors(num_sensors, area_size, seed=42):
         """Generate well-spaced sensor positions using seeded random with minimum distance."""
@@ -619,7 +628,7 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
     iot_nodes = generate_spread_sensors(NUM_SENSORS, AREA_SIZE, seed=42)
     
     sim_time = 0.0
-    SENSOR_RATE = 3.0
+    SENSOR_RATE = 2.0
     SENSOR_BUF_MAX = 50
     sensor_queues: List[List[Tuple[int, int, float]]] = [[] for _ in range(NUM_SENSORS)]
     MSG_COUNTER = 0
@@ -647,6 +656,13 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
     data_wifi_rx_energy = 0.0
     control_bytes_sent = 0
     data_bytes_sent = 0
+    
+    # Batching statistics (diagnostic counters)
+    sink_batches_sent = 0       # Number of batched transmissions to sink
+    sink_batch_samples = 0      # Total samples sent in sink batches
+    spray_batches_sent = 0      # Number of batched spray transmissions
+    spray_batch_samples = 0     # Total samples sent in spray batches  
+    single_msg_sends = 0        # Unbatched single message sends
     
     # Main loop
     while sim_time < duration:
@@ -806,6 +822,10 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
                             relayed_deliveries += 1
                         else:
                             direct_deliveries += 1
+                    
+                    # Track batching statistics
+                    sink_batches_sent += 1
+                    sink_batch_samples += len(batch)
             
             else:
                 # ========================================
@@ -857,6 +877,7 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
                         relayed_deliveries += 1
                     else:
                         direct_deliveries += 1
+                    single_msg_sends += 1  # Track unbatched sends
             
             # Remove delivered messages from buffer
             for m in msgs_to_remove:
@@ -906,71 +927,172 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
                 bytes_sent_this_step = 0
                 
                 # ========================================
-                # SPRAY PHASE (tokens > 1) - NO CONTROL
+                # SPRAY PHASE (tokens > 1) - BATCHED
                 # ========================================
-                for msg in spray_messages:
-                    if msg.msg_id in aj.seen_msgs:
-                        continue
-                    if len(aj.buffer) >= aj.MAX_BUFFER:
-                        continue
+                # Filter spray-eligible messages (tokens > 1, not seen by receiver, receiver has buffer space)
+                spray_eligible = []
+                for m in spray_messages:
+                    if m.msg_id not in aj.seen_msgs and len(aj.buffer) < aj.MAX_BUFFER:
+                        send_tokens = m.tokens // 2
+                        if send_tokens > 0:
+                            spray_eligible.append(m)
+                
+                if BATCH_ENABLE and len(spray_eligible) > 1:
+                    # ========================================
+                    # BATCHED SPRAY TRANSMISSION
+                    # ========================================
+                    msg_idx = 0
                     
-                    send_tokens = msg.tokens // 2
-                    if send_tokens <= 0:
-                        continue
-                    
-                    # Check bandwidth capacity
-                    frame_bytes = dds_frame_size(msg.payload_size())
-                    if bytes_sent_this_step + frame_bytes > max_bytes_this_step:
-                        break
-                    
-                    # Send DATA via DDS
-                    bits = frame_bytes * 8
-                    tx_e = bits * prof.E_tx_per_bit
-                    rx_e = bits * prof.E_rx_per_bit
-                    
-                    # Energy accounting
-                    ai.energy -= tx_e
-                    ai.radio_tx_energy += tx_e
-                    data_wifi_tx_energy += tx_e
-                    aj.energy -= rx_e
-                    aj.radio_rx_energy += rx_e
-                    data_wifi_rx_energy += rx_e
-                    
-                    # ACKNACK energy for RELIABLE QoS (receiver sends ACKNACK)
-                    if GLOBAL_QOS == 1:
-                        ack_bytes = dds_acknack_size()
-                        ack_bits = ack_bytes * 8
-                        ack_tx_e = ack_bits * prof.E_tx_per_bit
-                        ack_rx_e = ack_bits * prof.E_rx_per_bit
-                        aj.energy -= ack_tx_e
-                        aj.radio_tx_energy += ack_tx_e
-                        data_wifi_tx_energy += ack_tx_e
-                        ai.energy -= ack_rx_e
-                        ai.radio_rx_energy += ack_rx_e
-                        data_wifi_rx_energy += ack_rx_e
-                    
-                    data_bytes_sent += frame_bytes
-                    bytes_sent_this_step += frame_bytes
-                    
-                    # Create copy in neighbor
-                    new_msg = SprayMessage(
-                        msg_id=msg.msg_id,
-                        source_id=msg.source_id,
-                        creation_time=msg.creation_time,
-                        hop_count=msg.hop_count + 1,
-                        tokens=send_tokens,
-                        qos=msg.qos,
-                        payload_bytes=msg.payload_bytes,
+                    while msg_idx < len(spray_eligible) and len(aj.buffer) < aj.MAX_BUFFER:
+                        # Build batch respecting limits
+                        batch = []
+                        batch_payload_bytes = 0
                         
-                    )
-                    aj.buffer.append(new_msg)
-                    aj.seen_msgs.add(msg.msg_id)
-                    
-                    # Update sender
-                    msg.tokens -= send_tokens
-                    
-                    uav_relay_events += 1
-                    spray_events += 1
+                        while msg_idx < len(spray_eligible) and len(aj.buffer) + len(batch) < aj.MAX_BUFFER:
+                            msg = spray_eligible[msg_idx]
+                            msg_payload = msg.payload_size()
+                            
+                            # Check batch limits (sample count)
+                            if len(batch) >= BATCH_MAX_SAMPLES:
+                                break
+                            
+                            # Check batch limits (byte count)
+                            if batch_payload_bytes + msg_payload > BATCH_MAX_DATA_BYTES and len(batch) > 0:
+                                break
+                            
+                            batch.append(msg)
+                            batch_payload_bytes += msg_payload
+                            msg_idx += 1
+                        
+                        if not batch:
+                            break
+                        
+                        # Calculate batched frame size (shared RTPS header)
+                        payload_sizes = [m.payload_size() for m in batch]
+                        frame_bytes = dds_batched_frame_size_wifi(payload_sizes)
+                        
+                        # Check bandwidth capacity
+                        if bytes_sent_this_step + frame_bytes > max_bytes_this_step:
+                            break
+                        
+                        # Transmit batched frame via DDS
+                        bits = frame_bytes * 8
+                        tx_e = bits * prof.E_tx_per_bit
+                        rx_e = bits * prof.E_rx_per_bit
+                        
+                        ai.energy -= tx_e
+                        ai.radio_tx_energy += tx_e
+                        data_wifi_tx_energy += tx_e
+                        aj.energy -= rx_e
+                        aj.radio_rx_energy += rx_e
+                        data_wifi_rx_energy += rx_e
+                        
+                        # Single ACKNACK for entire batch (RELIABLE QoS)
+                        if GLOBAL_QOS == 1:
+                            ack_bytes = dds_acknack_size()
+                            ack_bits = ack_bytes * 8
+                            ack_tx_e = ack_bits * prof.E_tx_per_bit
+                            ack_rx_e = ack_bits * prof.E_rx_per_bit
+                            aj.energy -= ack_tx_e
+                            aj.radio_tx_energy += ack_tx_e
+                            data_wifi_tx_energy += ack_tx_e
+                            ai.energy -= ack_rx_e
+                            ai.radio_rx_energy += ack_rx_e
+                            data_wifi_rx_energy += ack_rx_e
+                        
+                        data_bytes_sent += frame_bytes
+                        bytes_sent_this_step += frame_bytes
+                        
+                        # Process all messages in batch
+                        for msg in batch:
+                            send_tokens = msg.tokens // 2
+                            
+                            # Create copy in neighbor
+                            new_msg = SprayMessage(
+                                msg_id=msg.msg_id,
+                                source_id=msg.source_id,
+                                creation_time=msg.creation_time,
+                                hop_count=msg.hop_count + 1,
+                                tokens=send_tokens,
+                                qos=msg.qos,
+                                payload_bytes=msg.payload_bytes,
+                            )
+                            aj.buffer.append(new_msg)
+                            aj.seen_msgs.add(msg.msg_id)
+                            
+                            # Update sender
+                            msg.tokens -= send_tokens
+                            
+                            uav_relay_events += 1
+                            spray_events += 1
+                        
+                        # Track batching statistics
+                        spray_batches_sent += 1
+                        spray_batch_samples += len(batch)
+                
+                else:
+                    # ========================================
+                    # UNBATCHED SPRAY (single message or disabled)
+                    # ========================================
+                    for msg in spray_eligible:
+                        if len(aj.buffer) >= aj.MAX_BUFFER:
+                            break
+                        
+                        send_tokens = msg.tokens // 2
+                        
+                        # Check bandwidth capacity
+                        frame_bytes = dds_frame_size(msg.payload_size())
+                        if bytes_sent_this_step + frame_bytes > max_bytes_this_step:
+                            break
+                        
+                        # Send DATA via DDS
+                        bits = frame_bytes * 8
+                        tx_e = bits * prof.E_tx_per_bit
+                        rx_e = bits * prof.E_rx_per_bit
+                        
+                        # Energy accounting
+                        ai.energy -= tx_e
+                        ai.radio_tx_energy += tx_e
+                        data_wifi_tx_energy += tx_e
+                        aj.energy -= rx_e
+                        aj.radio_rx_energy += rx_e
+                        data_wifi_rx_energy += rx_e
+                        
+                        # ACKNACK energy for RELIABLE QoS (receiver sends ACKNACK)
+                        if GLOBAL_QOS == 1:
+                            ack_bytes = dds_acknack_size()
+                            ack_bits = ack_bytes * 8
+                            ack_tx_e = ack_bits * prof.E_tx_per_bit
+                            ack_rx_e = ack_bits * prof.E_rx_per_bit
+                            aj.energy -= ack_tx_e
+                            aj.radio_tx_energy += ack_tx_e
+                            data_wifi_tx_energy += ack_tx_e
+                            ai.energy -= ack_rx_e
+                            ai.radio_rx_energy += ack_rx_e
+                            data_wifi_rx_energy += ack_rx_e
+                        
+                        data_bytes_sent += frame_bytes
+                        bytes_sent_this_step += frame_bytes
+                        
+                        # Create copy in neighbor
+                        new_msg = SprayMessage(
+                            msg_id=msg.msg_id,
+                            source_id=msg.source_id,
+                            creation_time=msg.creation_time,
+                            hop_count=msg.hop_count + 1,
+                            tokens=send_tokens,
+                            qos=msg.qos,
+                            payload_bytes=msg.payload_bytes,
+                        )
+                        aj.buffer.append(new_msg)
+                        aj.seen_msgs.add(msg.msg_id)
+                        
+                        # Update sender
+                        msg.tokens -= send_tokens
+                        
+                        uav_relay_events += 1
+                        spray_events += 1
+                        single_msg_sends += 1  # Track unbatched sends
                 
                 # ========================================
                 # FOCUS PHASE (tokens == 1) - WITH CONTROL
@@ -1207,12 +1329,24 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
         "total_uav_radio_energy": total_uav_radio,
         "energy_per_msg_mJ": (total_uav_radio / max(1, total_delivered)) * 1000,
         "control_bytes": control_bytes_sent,
-        "data_bytes": data_bytes_sent
+        "data_bytes": data_bytes_sent,
+        # Batching statistics
+        "sink_batches_sent": sink_batches_sent,
+        "sink_batch_samples": sink_batch_samples,
+        "spray_batches_sent": spray_batches_sent,
+        "spray_batch_samples": spray_batch_samples,
+        "single_msg_sends": single_msg_sends,
+        "avg_sink_batch_size": sink_batch_samples / max(1, sink_batches_sent),
+        "avg_spray_batch_size": spray_batch_samples / max(1, spray_batches_sent),
+        # Flight energy metrics (for mobile vs static sink tradeoff)
+        "sink_flight_energy_kJ": (initial_energy[SINK_ID] - agents[SINK_ID].energy - agents[SINK_ID].radio_tx_energy - agents[SINK_ID].radio_rx_energy) / 1000.0,
+        "total_system_energy_kJ": sum(initial_energy[uid] - agents[uid].energy for uid in agents) / 1000.0,
     }
     
     if verbose:
         print(f"  [SPRAY&FOCUS DDS] PDR: {results['pdr']:.1f}% | Latency: {results['avg_latency']:.2f}s | "
-              f"Spray: {spray_events} | Focus: {focus_events}")
+              f"Spray: {spray_events} | Focus: {focus_events} | "
+              f"Batches: {sink_batches_sent + spray_batches_sent} (sink:{sink_batches_sent}, spray:{spray_batches_sent})")
     
     return results
 

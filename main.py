@@ -81,7 +81,7 @@ def run_mqtt_baseline(config: dict) -> dict:
 
 def run_mqtt_enhanced(config: dict) -> dict:
     """MQTT Enhanced S&F simulation - delegates to validated standalone module."""
-    import NEW_REPLICATION_EDGESRONE as m
+    import S&F_MQTT as m
 
     # Set globals for the module
     m.GLOBAL_QOS = config.get("GLOBAL_QOS", 1)
@@ -98,12 +98,12 @@ def run_mqtt_enhanced(config: dict) -> dict:
 
 
 def run_vanilla_dds(config: dict) -> dict:
-    from vanilla_DDS import run_vanilla_dds_simulation
+    from BASELINE_DDS import run_vanilla_dds_simulation
     return run_vanilla_dds_simulation(config, verbose=False)
 
 
 def run_dds_spray_focus(config: dict) -> dict:
-    from spray_focus_DDS import run_spray_focus_dds_simulation
+    from S&F_DDS import run_spray_focus_dds_simulation
     return run_spray_focus_dds_simulation(config, verbose=False)
 
 

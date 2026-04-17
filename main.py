@@ -1,5 +1,5 @@
 """
-Comprehensive Parameter Sweep Benchmark for Q1 Journal Publication
+Comprehensive Parameter Sweep Benchmark
 
 Experiments:
 1. Scalability: Vary NUM_UAVS [4, 6, 8, 10, 12]
@@ -19,7 +19,6 @@ from datetime import datetime
 from typing import Dict, List, Any
 
 sys.path.insert(0, 'c:/Users/akrem/OneDrive - KFUPM/Desktop/Fastdds_Python - Copy')
-import zlib  # For stable hash
 
 # ==========================================
 # CONFIGURATION
@@ -32,24 +31,23 @@ BASELINE = {
     "NUM_UAVS": 6,
     "NUM_SENSORS": 10,
     "DURATION": 3000.0,
-    "INITIAL_TOKENS": 8,   # Reduced from 6 to allow Focus phase with fewer UAVs
-    "AREA_SIZE": 750,     # Standard area
-    "SINK_MOBILE": True,   # Mobile sink participates in routing
+    "INITIAL_TOKENS": 8,   
+    "AREA_SIZE": 750,     
+    "SINK_MOBILE": True,  
     "WIFI_PAYLOAD_BYTES": 64, 
     "GLOBAL_QOS": 1,
     "NUM_SINKS": 1,
-    "MAX_BUFFER": 200,     # Reduced to 250 as per user request
-    "BATCH_ENABLE": False   # Disable DDS batching for fair comparison
+    "MAX_BUFFER": 200,    
+    "BATCH_ENABLE": True   
 }
 
 # Parameter variationssweep
 PARAM_SWEEPS = {
     "NUM_UAVS": [4, 6, 8, 10, 12],
     "NUM_SENSORS": [4, 8, 16, 32, 64],
-    "WIFI_PAYLOAD_BYTES": [64, 128, 256, 512],  # Only WiFi links (ZigBee sensor payload is fixed at 64)
+    # "WIFI_PAYLOAD_BYTES": [64, 128, 256, 512],  # Only WiFi links (ZigBee sensor payload is fixed at 64)
     # "SINK_MOBILE": [True, False],
-    
-    "AREA_SIZE": [500, 750, 1000, 1250, 1500]  # Network density sweep
+    "AREA_SIZE": [500, 750, 1000, 1250, 1500] 
 }
 
 METRICS = [
@@ -58,10 +56,10 @@ METRICS = [
     "median_latency",
     "energy_per_msg_mJ",
     "avg_hops",
-    "avg_hops_relayed",      # NEW: Only relayed messages (hop_count > 0)
-    "direct_deliveries",     # NEW: IoT → Sink directly
-    "relayed_deliveries",    # NEW: Via UAV relay
-    "direct_delivery_ratio", # NEW: Percentage of direct deliveries
+    "avg_hops_relayed",     
+    "direct_deliveries",     
+    "relayed_deliveries",    
+    "direct_delivery_ratio", 
     "total_delivered",
     "spray_events",
     "focus_events",
@@ -170,7 +168,7 @@ def run_experiment_set(param_name: str, param_values: list, output_prefix: str):
     all_results = []
     
     for val in param_values:
-        print(f"\n📊 {param_name} = {val}")
+        print(f"\n{param_name} = {val}")
         
         for proto in PROTOCOLS:
             config = BASELINE.copy()
@@ -181,11 +179,6 @@ def run_experiment_set(param_name: str, param_values: list, output_prefix: str):
             
             for run in range(NUM_RUNS):
                 print_progress(run + 1, NUM_RUNS, proto["label"])
-                
-                # CRITICAL: Seed RNG for reproducibility (different seed per run, but deterministic)
-                # seed = run * 1000 + zlib.crc32(str(val).encode()) % 10000
-                # random.seed(seed)
-                # np.random.seed(seed)
                 
                 try:
                     result = proto["runner"](config)
@@ -223,7 +216,7 @@ def run_experiment_set(param_name: str, param_values: list, output_prefix: str):
             writer.writeheader()
             writer.writerows(all_results)
     
-    print(f"\n📁 Saved: {filename}")
+    print(f"\n Saved: {filename}")
     return filename
 
 

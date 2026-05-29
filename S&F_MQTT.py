@@ -342,7 +342,7 @@ def run_mqtt_simulation():
     iot_nodes = generate_spread_sensors(NUM_SENSORS, 500, seed=42)
 
     sim_time    = 0.0
-    duration    = 1500.0
+    duration    = 3000.0
     dt          = 0.1
     SENSOR_RATE = 2.0
     MSG_COUNTER = 0

@@ -414,7 +414,7 @@ def run_spray_focus_dds_simulation(config: dict, verbose: bool = False) -> dict:
     AREA_SIZE = config.get("AREA_SIZE", 500)
     SINK_MOBILE = config.get("SINK_MOBILE", True)
     RELIABLE = GLOBAL_QOS == 1
-    duration = config.get("DURATION", 1500.0)
+    duration = config.get("DURATION", 3000.0)
     dt = 0.1
 
     if "WIFI_PAYLOAD_BYTES" in config:

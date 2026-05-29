@@ -277,7 +277,7 @@ def run_baseline_simulation(config: dict, verbose: bool = False) -> dict:
 
     AREA_SIZE   = config.get("AREA_SIZE",  750)
     SINK_MOBILE = config.get("SINK_MOBILE", True)
-    duration    = config.get("DURATION",  1500.0)
+    duration    = config.get("DURATION",  3000.0)
     dt          = 0.1
 
     if "WIFI_PAYLOAD_BYTES" in config:
